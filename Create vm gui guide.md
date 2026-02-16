@@ -14,7 +14,7 @@ ssh-keygen -t rsa -q -f /home/student/.ssh/id_rsa  -N ""
 
 ### Create a VirtualMachine in the `banana` project with below requirements
 
-- User `ram` should create a VirtualMachine named `myvm-lan1` from template "Red Hat Enterprise Linux 9 VM"
+- User `ram` should create a VirtualMachine named `testvm` from template "Red Hat Enterprise Linux 9 VM"
 - Use PVC URL, `http://utility.lab.example.com:8080/openshift4/images/rhel9-helloworld.qcow2`
 - The StorageClassName is `ocs-external-storagecluster-ceph-rbd-virtualization`
 - The PVC size should be 30GiB
@@ -71,7 +71,7 @@ ssh-keygen -t rsa -q -f /home/student/.ssh/id_rsa -N ""
 
 ---
 
-## Solution: Creating VirtualMachine `myvm-lan1`
+## Solution: Creating VirtualMachine `testvm`
 
 ### Step 1: Login to OpenShift Web Console as User `ram`
 
@@ -117,7 +117,7 @@ ssh-keygen -t rsa -q -f /home/student/.ssh/id_rsa -N ""
 
 **In the General section:**
 
-1. **Name:** `myvm-lan1`
+1. **Name:** `testvm`
 2. **Project:** Verify it shows `banana`
 3. **Template:** Red Hat Enterprise Linux 9 VM (already selected)
 4. **Workload type:** Select **Server**
@@ -131,7 +131,7 @@ ssh-keygen -t rsa -q -f /home/student/.ssh/id_rsa -N ""
 
 1. **Boot source type:** Select **URL (creates PVC)**
 2. **Image URL:** `http://utility.lab.example.com:8080/openshift4/images/rhel9-helloworld.qcow2`
-3. **PVC name:** `myvm-lan1-boot` (auto-generated or specify)
+3. **PVC name:** `testvm-boot` (auto-generated or specify)
 4. **Storage class:** Select `ocs-external-storagecluster-ceph-rbd-virtualization`
 5. **PVC size:** `30 GiB`
 6. **Access mode:** Will be set by volume mode
@@ -258,7 +258,7 @@ EOF
 
 1. Review all configurations in the summary panel (right side)
 2. Verify all settings are correct:
-   - Name: `myvm-lan1`
+   - Name: `testvm`
    - Project: `banana`
    - Workload: Server
    - Flavor: Small
@@ -275,7 +275,7 @@ EOF
 After creation:
 
 1. The VM appears in the VirtualMachines list
-2. Click on **myvm-lan1** to view details
+2. Click on **testvm** to view details
 3. Click **Actions** → **Start** (or click the Start button)
 4. Wait for the VM to boot (status changes to **Running**)
 5. Monitor the **Events** and **Console** tabs for progress
@@ -292,29 +292,29 @@ oc login -u ram -p ram123 https://api.ocp4.example.com:6443
 oc project banana
 
 # Check VM status
-oc get vm myvm-lan1
+oc get vm testvm
 
 # Check VMI (VirtualMachineInstance)
-oc get vmi myvm-lan1
+oc get vmi testvm
 
 # Describe VM to see full configuration
-oc describe vm myvm-lan1
+oc describe vm testvm
 
 # Verify network interfaces
-oc get vmi myvm-lan1 -o jsonpath='{.spec.domain.devices.interfaces[*].name}' && echo
+oc get vmi testvm -o jsonpath='{.spec.domain.devices.interfaces[*].name}' && echo
 
 # Verify readiness probe
-oc get vmi myvm-lan1 -o yaml | grep -A 10 readinessProbe
+oc get vmi testvm -o yaml | grep -A 10 readinessProbe
 ```
 
 ### Verify Network Connectivity:
 
 ```bash
 # Get VM IP addresses
-oc get vmi myvm-lan1 -o jsonpath='{.status.interfaces[*].ipAddress}' && echo
+oc get vmi testvm -o jsonpath='{.status.interfaces[*].ipAddress}' && echo
 
 # Console access
-virtctl console myvm-lan1
+virtctl console testvm
 
 # SSH access (if cloud-init completed)
 ssh ram@<vm-ip-address>
@@ -324,10 +324,10 @@ ssh ram@<vm-ip-address>
 
 ```bash
 # Check PVC created for boot disk
-oc get pvc | grep myvm-lan1
+oc get pvc | grep testvm
 
 # Verify PVC details
-oc describe pvc myvm-lan1-boot
+oc describe pvc testvm-boot
 ```
 
 ---
@@ -336,7 +336,7 @@ oc describe pvc myvm-lan1-boot
 
 | Component | Value |
 |-----------|-------|
-| **VM Name** | myvm-lan1 |
+| **VM Name** | testvm |
 | **Project** | banana |
 | **Template** | Red Hat Enterprise Linux 9 VM |
 | **Workload Type** | Server |
@@ -366,7 +366,7 @@ oc describe pvc myvm-lan1-boot
 ### If VM fails to start:
 
 1. Check Events in the VM details page
-2. Review logs: `oc logs virt-launcher-myvm-lan1-xxxxx`
+2. Review logs: `oc logs virt-launcher-testvm-xxxxx`
 3. Verify PVC is bound: `oc get pvc`
 4. Check if image download succeeded
 
@@ -378,7 +378,7 @@ oc describe pvc myvm-lan1-boot
 
 ### If readiness probe fails:
 
-1. Access VM console: `virtctl console myvm-lan1`
+1. Access VM console: `virtctl console testvm`
 2. Check if the service on port 80 is running
 3. Verify the `/health` endpoint exists
 4. Adjust probe timings if service takes longer to start
