@@ -20,6 +20,8 @@
 - Sufficient resources (minimum 8GB RAM, 4 vCPUs per worker node)
 
 ---
+## If you are using Redhat Lab, then run this command.
+lab start virtualization-deploy
 
 ## Step 1: Deploy OpenShift Virtualization Operator
 
