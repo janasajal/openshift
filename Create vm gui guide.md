@@ -1,208 +1,345 @@
-# Create Virtual Machine in OpenShift Virtualization - GUI Guide
+# Creating VirtualMachine in OpenShift Virtualization - Step-by-Step GUI Guide
 
-**Author:** Sajal Jana
+## Prerequisites - Lab Preparation
 
----
+```bash
+# Start the lab environment
+lab start accessing-guicreate
 
-## Table of Contents
+# Login as admin
+oc login -u admin -p redhatocp https://api.ocp4.example.com:6443
 
-1. [Prerequisites](#prerequisites)
-2. [Step 1: Navigate to Virtualization](#step-1-navigate-to-virtualization)
-3. [Step 2: Create Virtual Machine](#step-2-create-virtual-machine)
-4. [Step 3: Configure Basic Settings](#step-3-configure-basic-settings)
-5. [Step 4: Configure Storage](#step-4-configure-storage)
-6. [Step 5: Configure Networking](#step-5-configure-networking)
-7. [Step 6: Configure Cloud-Init](#step-6-configure-cloud-init)
-8. [Step 7: Configure Readiness Probe](#step-7-configure-readiness-probe)
-9. [Step 8: Review and Create](#step-8-review-and-create)
-10. [Verification](#verification)
+# Generate SSH key
+ssh-keygen -t rsa -q -f /home/student/.ssh/id_rsa -N ""
+```
 
 ---
 
-## Prerequisites
+## Solution: Creating VirtualMachine `myvm-lan1`
 
-- OpenShift Virtualization operator installed
-- Project `banana` created
-- Network attachment definition `database-network` exists in `banana` namespace
-- SSH public key from `/home/student/.ssh/lab_rsa.pub` available
+### Step 1: Login to OpenShift Web Console as User `ram`
 
----
-
-## Step 1: Navigate to Virtualization
-
-**Purpose:** Access the VM management interface in the banana project
-
-1. Login to **OpenShift Web Console**
-2. Switch to **Administrator** perspective
-3. Select project: **banana** (from project dropdown)
-4. Click **Virtualization** → **VirtualMachines** in left menu
+1. Open browser and navigate to OpenShift Console: `https://console-openshift-console.apps.ocp4.example.com`
+2. Click **htpasswd_provider** (or your configured identity provider)
+3. Enter credentials:
+   - **Username:** `ram`
+   - **Password:** `ram2001`
+4. Click **Log in**
 
 ---
 
-## Step 2: Create Virtual Machine
+### Step 2: Navigate to the `banana` Project
 
-**Purpose:** Initiate VM creation using RHEL 9 template
-
-1. Click **Create** → **From template**
-2. Select template: **Red Hat Enterprise Linux 9 VM**
-3. Click **Customize VirtualMachine**
-
----
-
-## Step 3: Configure Basic Settings
-
-**Purpose:** Set VM name, workload type, and resource flavor
-
-1. **General** section:
-   - **Name:** `myvm-lan1`
-   - **Workload type:** `Server`
-   - **Flavor:** `Small`
-
-2. Click **Next** or scroll to **Storage** section
+1. In the top navigation bar, click the **Project** dropdown
+2. Select or search for **banana** project
+3. If project doesn't exist, create it:
+   - Click **Create Project**
+   - **Name:** `banana`
+   - Click **Create**
 
 ---
 
-## Step 4: Configure Storage
+### Step 3: Access OpenShift Virtualization
 
-**Purpose:** Configure 30Gi block storage using HTTP URL as boot source
-
-1. **Boot source** section:
-   - **Source type:** Select `URL (creates PVC)`
-   - **URL:** `http://utility.lab.example.com:8080/openshift4/images/rhel9-helloworld.qcow2`
-
-2. **Disk** configuration:
-   - **PVC size:** `30` (GiB)
-   - **Storage class:** `ocs-external-storagecluster-ceph-rbd-virtualization`
-   - **Volume mode:** `Block`
-   - **Access mode:** `ReadWriteMany` (auto-selected)
-
-3. Click **Next** or scroll to **Network interfaces**
+1. In the left sidebar, click **Virtualization**
+2. This expands the Virtualization menu
+3. Click **VirtualMachines** under Virtualization section
 
 ---
 
-## Step 5: Configure Networking
+### Step 4: Create New VirtualMachine from Template
 
-**Purpose:** Configure dual network interfaces - pod networking and database-network bridge
-
-### Interface 1 (Default - Already exists)
-
-- **Name:** `default`
-- **Model:** `virtio`
-- **Network:** `Pod networking`
-- **Type:** `masquerade`
-- Leave as default
-
-### Interface 2 (Add New)
-
-1. Click **Add network interface**
-2. Configure:
-   - **Name:** `nic-0`
-   - **Model:** `virtio`
-   - **Network:** Select `database-network` (from banana namespace)
-   - **Type:** `Bridge`
-3. Click **Save**
+1. Click **Create** button (top right)
+2. Select **From template**
+3. In the template catalog, find and click **Red Hat Enterprise Linux 9 VM**
+4. Click **Quick create VirtualMachine** or **Customize VirtualMachine**
+5. Select **Customize VirtualMachine** for full configuration options
 
 ---
 
-## Step 6: Configure Cloud-Init
+### Step 5: Configure Basic VM Details
 
-**Purpose:** Set up user credentials and SSH key authentication
+**In the General section:**
 
-1. Scroll to **Scripts** section
-2. Click **Cloud-init** tab or **Edit** if visible
-3. Select **Configure via: Script**
-4. Paste the following cloud-init configuration:
+1. **Name:** `myvm-lan1`
+2. **Project:** Verify it shows `banana`
+3. **Template:** Red Hat Enterprise Linux 9 VM (already selected)
+4. **Workload type:** Select **Server**
+5. **Flavor:** Select **Small**
+
+---
+
+### Step 6: Configure Boot Source (PVC from URL)
+
+**In the Boot source section:**
+
+1. **Boot source type:** Select **URL (creates PVC)**
+2. **Image URL:** `http://utility.lab.example.com:8080/openshift4/images/rhel9-helloworld.qcow2`
+3. **PVC name:** `myvm-lan1-boot` (auto-generated or specify)
+4. **Storage class:** Select `ocs-external-storagecluster-ceph-rbd-virtualization`
+5. **PVC size:** `30 GiB`
+6. **Access mode:** Will be set by volume mode
+7. **Volume mode:** Select **Block**
+
+---
+
+### Step 7: Configure Cloud-init
+
+**In the Scripts section or Advanced → Cloud-init:**
+
+1. Click **Scripts** tab (or **Advanced** → **Cloud-init**)
+2. Enable **Configure via cloud-init**
+3. Select **Edit** to customize cloud-init
+
+**Add the following cloud-init configuration:**
 
 ```yaml
 #cloud-config
 user: ram
-password: ram2026
+password: anishrana2001
 chpasswd:
   expire: false
 ssh_authorized_keys:
-  - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC... devops@workstation
+  - ssh-rsa AAAAB3NzaC1yc2E... (paste content from /home/student/.ssh/lab_rsa.pub)
 ```
 
-**Note:** Replace the SSH key with actual content from `/home/student/.ssh/lab_rsa.pub`
+**To get the SSH public key content:**
+```bash
+cat /home/student/.ssh/lab_rsa.pub
+```
 
-5. Click **Apply** or **Save**
+**Alternatively, use the UI fields:**
+- **User:** `ram`
+- **Password:** `anishrana2001`
+- **Authorized SSH key:** Click **Add SSH key** and paste the content of `/home/student/.ssh/lab_rsa.pub`
 
 ---
 
-## Step 7: Configure Readiness Probe
+### Step 8: Configure Network Interfaces
 
-**Purpose:** Configure TCP health check on SSH port to monitor VM readiness
+**Navigate to the Networking section:**
 
-1. Scroll to **Advanced** section
-2. Click **Health checks** or **Probes**
-3. Click **Add readiness probe**
-4. Configure:
-   - **Probe type:** `TCP Socket`
-   - **Port:** `22`
-   - **Initial delay (seconds):** `120`
-   - **Period (seconds):** `10`
-   - **Timeout (seconds):** `5`
+#### First Network Interface (Default - Already configured):
+
+1. **Interface name:** `default`
+2. **Network:** `Pod networking` (default)
+3. **Type:** `masquerade`
+4. **Model:** `virtio`
+
+This interface is typically configured by default. Verify settings:
+- Click on the **default** interface
+- Ensure **Type** is `masquerade`
+- Ensure **Model** is `virtio`
+
+#### Add Second Network Interface:
+
+1. Click **Add network interface** button
+2. Configure as follows:
+   - **Name:** `nic-0`
+   - **Network:** Select `banana/database-network`
+     - If not in dropdown, you may need to type: `banana/database-network`
+   - **Type:** `bridge`
+   - **Model:** `virtio`
+   - **MAC address:** Leave as auto-generated (OpenShift will assign IP via IPAM)
+3. Click **Add** or **Save**
+
+**Note:** The `banana/database-network` NetworkAttachmentDefinition must exist beforehand. If it doesn't exist, create it first:
+
+```bash
+# As admin, create the network attachment definition
+oc login -u admin -p redhatocp https://api.ocp4.example.com:6443
+oc project banana
+
+cat <<EOF | oc apply -f -
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: database-network
+  namespace: banana
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "type": "bridge",
+      "bridge": "br-database",
+      "ipam": {
+        "type": "host-local",
+        "subnet": "192.168.100.0/24"
+      }
+    }
+EOF
+```
+
+---
+
+### Step 9: Configure Readiness Probe
+
+**Navigate to Advanced → Health checks:**
+
+1. Click **Add health check** (or **Add readiness probe**)
+2. Select **Readiness probe**
+3. Configure the probe:
+   - **Probe type:** `HTTP GET`
+   - **Path:** `/health`
+   - **Port:** `80`
+   - **Initial delay (seconds):** `10`
+   - **Period (seconds):** `5`
+   - **Timeout (seconds):** `2`
    - **Success threshold:** `1`
-   - **Failure threshold:** `3`
-5. Click **Save** or **Apply**
+   - **Failure threshold:** `2`
+4. Click **Add** or **Save**
+
+**UI Field Mapping:**
+- **initialDelaySeconds** → Initial delay: `10`
+- **periodSeconds** → Period: `5`
+- **timeoutSeconds** → Timeout: `2`
+- **failureThreshold** → Failure threshold: `2`
+- **successThreshold** → Success threshold: `1`
 
 ---
 
-## Step 8: Review and Create
+### Step 10: Review and Create VM
 
-**Purpose:** Finalize configuration and deploy the virtual machine
-
-1. Review all configurations
-2. Ensure **Start this VirtualMachine after creation** is checked
-3. Click **Create VirtualMachine**
-
----
-
-## Verification
-
-### Check VM Status
-
-1. Navigate to **Virtualization** → **VirtualMachines**
-2. Find `myvm-lan1` in the list
-3. Wait for status to change to **Running** (may take 5-10 minutes)
-4. Verify readiness probe shows **Ready**
-
-### Verify Network Configuration
-
-1. Click on `myvm-lan1` VM name
-2. Go to **Network interfaces** tab
-3. Verify two interfaces:
-   - `default` (masquerade, Pod networking)
-   - `nic-0` (bridge, database-network)
-
-### Verify Storage
-
-1. Click **Disks** tab
-2. Verify `myvm-lan1-rootdisk` shows:
-   - Size: `30Gi`
-   - Storage class: `ocs-external-storagecluster-ceph-rbd-virtualization`
-
-### Access VM Console
-
-1. Click **Console** tab
-2. Login with credentials:
-   - **User:** `ram`
-   - **Password:** `ram2026`
-3. Verify SSH access works (readiness probe on port 22)
+1. Review all configurations in the summary panel (right side)
+2. Verify all settings are correct:
+   - Name: `myvm-lan1`
+   - Project: `banana`
+   - Workload: Server
+   - Flavor: Small
+   - Boot source: URL with 30GiB Block PVC
+   - Network interfaces: 2 (default + nic-0)
+   - Cloud-init configured with user `ram`
+   - Readiness probe configured
+3. Click **Create VirtualMachine** button
 
 ---
 
-## Summary
+### Step 11: Start the VirtualMachine
 
-Virtual Machine `myvm-lan1` has been successfully created with:
+After creation:
 
-- ✅ RHEL 9 template
-- ✅ Server workload, Small flavor
-- ✅ 30Gi Block storage from URL source
-- ✅ Two network interfaces (Pod + database-network)
-- ✅ Cloud-init with user ram and SSH key
-- ✅ TCP readiness probe on port 22
+1. The VM appears in the VirtualMachines list
+2. Click on **myvm-lan1** to view details
+3. Click **Actions** → **Start** (or click the Start button)
+4. Wait for the VM to boot (status changes to **Running**)
+5. Monitor the **Events** and **Console** tabs for progress
 
 ---
 
-*End of Document*
+## Verification Steps
+
+### Verify VM Configuration:
+
+```bash
+# Login as ram or admin
+oc login -u ram -p anishrana2001 https://api.ocp4.example.com:6443
+oc project banana
+
+# Check VM status
+oc get vm myvm-lan1
+
+# Check VMI (VirtualMachineInstance)
+oc get vmi myvm-lan1
+
+# Describe VM to see full configuration
+oc describe vm myvm-lan1
+
+# Verify network interfaces
+oc get vmi myvm-lan1 -o jsonpath='{.spec.domain.devices.interfaces[*].name}' && echo
+
+# Verify readiness probe
+oc get vmi myvm-lan1 -o yaml | grep -A 10 readinessProbe
+```
+
+### Verify Network Connectivity:
+
+```bash
+# Get VM IP addresses
+oc get vmi myvm-lan1 -o jsonpath='{.status.interfaces[*].ipAddress}' && echo
+
+# Console access
+virtctl console myvm-lan1
+
+# SSH access (if cloud-init completed)
+ssh ram@<vm-ip-address>
+```
+
+### Verify PVC:
+
+```bash
+# Check PVC created for boot disk
+oc get pvc | grep myvm-lan1
+
+# Verify PVC details
+oc describe pvc myvm-lan1-boot
+```
+
+---
+
+## Summary of Configuration
+
+| Component | Value |
+|-----------|-------|
+| **VM Name** | myvm-lan1 |
+| **Project** | banana |
+| **Template** | Red Hat Enterprise Linux 9 VM |
+| **Workload Type** | Server |
+| **Flavor** | Small |
+| **Boot Source** | URL (PVC) |
+| **Image URL** | http://utility.lab.example.com:8080/openshift4/images/rhel9-helloworld.qcow2 |
+| **Storage Class** | ocs-external-storagecluster-ceph-rbd-virtualization |
+| **PVC Size** | 30 GiB |
+| **Volume Mode** | Block |
+| **Cloud-init User** | ram |
+| **Cloud-init Password** | anishrana2001 |
+| **SSH Key** | /home/student/.ssh/lab_rsa.pub |
+| **NIC 1 Name** | default |
+| **NIC 1 Network** | Pod networking |
+| **NIC 1 Type** | masquerade |
+| **NIC 1 Model** | virtio |
+| **NIC 2 Name** | nic-0 |
+| **NIC 2 Network** | banana/database-network |
+| **NIC 2 Type** | bridge |
+| **NIC 2 Model** | virtio |
+| **Readiness Probe** | HTTP GET /health:80 |
+
+---
+
+## Troubleshooting
+
+### If VM fails to start:
+
+1. Check Events in the VM details page
+2. Review logs: `oc logs virt-launcher-myvm-lan1-xxxxx`
+3. Verify PVC is bound: `oc get pvc`
+4. Check if image download succeeded
+
+### If network interface doesn't attach:
+
+1. Verify NetworkAttachmentDefinition exists: `oc get network-attachment-definitions -n banana`
+2. Check Multus is configured properly
+3. Verify bridge CNI plugin is available
+
+### If readiness probe fails:
+
+1. Access VM console: `virtctl console myvm-lan1`
+2. Check if the service on port 80 is running
+3. Verify the `/health` endpoint exists
+4. Adjust probe timings if service takes longer to start
+
+---
+
+## Additional Notes
+
+- The VM template may have default values that need to be adjusted
+- Ensure the `banana/database-network` NetworkAttachmentDefinition is created before adding the second NIC
+- The SSH key must be the public key from `/home/student/.ssh/lab_rsa.pub`
+- Cloud-init may take a few minutes to complete after VM boot
+- The readiness probe will only pass when the HTTP service on port 80 responds successfully to `/health` endpoint
+
+---
+
+**Lab Completion Command:**
+```bash
+lab finish accessing-guicreate
+```
