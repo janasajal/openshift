@@ -1,5 +1,61 @@
 # Creating VirtualMachine in OpenShift Virtualization - Step-by-Step GUI Guide
 
+---
+
+## Question
+
+### Prepare the lab for this question
+
+```bash
+lab start accessing-guicreate
+oc login -u admin -p redhatocp https://api.ocp4.example.com:6443
+ssh-keygen -t rsa -q -f /home/student/.ssh/id_rsa  -N ""
+```
+
+### Create a VirtualMachine in the `banana` project with below requirements
+
+- User `ram` should create a VirtualMachine named `myvm-lan1` from template "Red Hat Enterprise Linux 9 VM"
+- Use PVC URL, `http://utility.lab.example.com:8080/openshift4/images/rhel9-helloworld.qcow2`
+- The StorageClassName is `ocs-external-storagecluster-ceph-rbd-virtualization`
+- The PVC size should be 30GiB
+- The Volume mode should be Block
+- The workload type is the VirtualMachine is `server`
+- The flavor type of the VirtualMachine is `small`
+- The network interface name is `default`
+- The user `ram` with password `ram123` exists in the cloud-init definition
+- The ssh Key "/home/student/.ssh/lab_rsa.pub" from user devops at workstation has been added as an authorized ssh key via the cloud-init definition
+
+### Task: Configure Network interface
+
+**The first Network Interface configuration:**
+- The first Network interface name is `default`
+- The First Network interface is attached to the `pod networking` (default) network
+- The first network interface type is `masquerade`
+- The model for the first network interface is `virtio`
+
+**The Second Network Interface Configuration:**
+- The second network interface name is `nic-0`
+- The second network interface is attached to the `banana/database-network` network
+- The second network interface type is `bridge`
+- The IP address of the second network interface is provided by OpenShift
+- The model for the second network interface is `virtio`
+
+### Task: Create a Readiness probe with below configuration
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 80
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 2
+  successThreshold: 1
+```
+
+---
+
 ## Prerequisites - Lab Preparation
 
 ```bash
@@ -23,7 +79,7 @@ ssh-keygen -t rsa -q -f /home/student/.ssh/id_rsa -N ""
 2. Click **htpasswd_provider** (or your configured identity provider)
 3. Enter credentials:
    - **Username:** `ram`
-   - **Password:** `ram2001`
+   - **Password:** `ram123`
 4. Click **Log in**
 
 ---
@@ -96,7 +152,7 @@ ssh-keygen -t rsa -q -f /home/student/.ssh/id_rsa -N ""
 ```yaml
 #cloud-config
 user: ram
-password: anishrana2001
+password: ram
 chpasswd:
   expire: false
 ssh_authorized_keys:
@@ -110,7 +166,7 @@ cat /home/student/.ssh/lab_rsa.pub
 
 **Alternatively, use the UI fields:**
 - **User:** `ram`
-- **Password:** `anishrana2001`
+- **Password:** `ram123`
 - **Authorized SSH key:** Click **Add SSH key** and paste the content of `/home/student/.ssh/lab_rsa.pub`
 
 ---
@@ -232,7 +288,7 @@ After creation:
 
 ```bash
 # Login as ram or admin
-oc login -u ram -p anishrana2001 https://api.ocp4.example.com:6443
+oc login -u ram -p ram123 https://api.ocp4.example.com:6443
 oc project banana
 
 # Check VM status
@@ -291,7 +347,7 @@ oc describe pvc myvm-lan1-boot
 | **PVC Size** | 30 GiB |
 | **Volume Mode** | Block |
 | **Cloud-init User** | ram |
-| **Cloud-init Password** | anishrana2001 |
+| **Cloud-init Password** | ram123 |
 | **SSH Key** | /home/student/.ssh/lab_rsa.pub |
 | **NIC 1 Name** | default |
 | **NIC 1 Network** | Pod networking |
