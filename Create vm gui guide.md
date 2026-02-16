@@ -12,7 +12,7 @@ oc login -u admin -p redhatocp https://api.ocp4.example.com:6443
 ssh-keygen -t rsa -q -f /home/student/.ssh/id_rsa  -N ""
 ```
 
-### Create a VirtualMachine in the `banana` project with below requirements
+### Create a VirtualMachine in the `orange` project with below requirements
 
 - User `ram` should create a VirtualMachine named `testvm` from template "Red Hat Enterprise Linux 9 VM"
 - Use PVC URL, `http://utility.lab.example.com:8080/openshift4/images/rhel9-helloworld.qcow2`
@@ -35,7 +35,7 @@ ssh-keygen -t rsa -q -f /home/student/.ssh/id_rsa  -N ""
 
 **The Second Network Interface Configuration:**
 - The second network interface name is `nic-0`
-- The second network interface is attached to the `banana/database-network` network
+- The second network interface is attached to the `orange/database-network` network
 - The second network interface type is `bridge`
 - The IP address of the second network interface is provided by OpenShift
 - The model for the second network interface is `virtio`
@@ -84,13 +84,13 @@ ssh-keygen -t rsa -q -f /home/student/.ssh/id_rsa -N ""
 
 ---
 
-### Step 2: Navigate to the `banana` Project
+### Step 2: Navigate to the `orange` Project
 
 1. In the top navigation bar, click the **Project** dropdown
-2. Select or search for **banana** project
+2. Select or search for **orange** project
 3. If project doesn't exist, create it:
    - Click **Create Project**
-   - **Name:** `banana`
+   - **Name:** `orange`
    - Click **Create**
 
 ---
@@ -118,7 +118,7 @@ ssh-keygen -t rsa -q -f /home/student/.ssh/id_rsa -N ""
 **In the General section:**
 
 1. **Name:** `testvm`
-2. **Project:** Verify it shows `banana`
+2. **Project:** Verify it shows `orange`
 3. **Template:** Red Hat Enterprise Linux 9 VM (already selected)
 4. **Workload type:** Select **Server**
 5. **Flavor:** Select **Small**
@@ -192,26 +192,26 @@ This interface is typically configured by default. Verify settings:
 1. Click **Add network interface** button
 2. Configure as follows:
    - **Name:** `nic-0`
-   - **Network:** Select `banana/database-network`
-     - If not in dropdown, you may need to type: `banana/database-network`
+   - **Network:** Select `orange/database-network`
+     - If not in dropdown, you may need to type: `orange/database-network`
    - **Type:** `bridge`
    - **Model:** `virtio`
    - **MAC address:** Leave as auto-generated (OpenShift will assign IP via IPAM)
 3. Click **Add** or **Save**
 
-**Note:** The `banana/database-network` NetworkAttachmentDefinition must exist beforehand. If it doesn't exist, create it first:
+**Note:** The `orange/database-network` NetworkAttachmentDefinition must exist beforehand. If it doesn't exist, create it first:
 
 ```bash
 # As admin, create the network attachment definition
 oc login -u admin -p redhatocp https://api.ocp4.example.com:6443
-oc project banana
+oc project orange
 
 cat <<EOF | oc apply -f -
 apiVersion: k8s.cni.cncf.io/v1
 kind: NetworkAttachmentDefinition
 metadata:
   name: database-network
-  namespace: banana
+  namespace: orange
 spec:
   config: |
     {
@@ -259,7 +259,7 @@ EOF
 1. Review all configurations in the summary panel (right side)
 2. Verify all settings are correct:
    - Name: `testvm`
-   - Project: `banana`
+   - Project: `orange`
    - Workload: Server
    - Flavor: Small
    - Boot source: URL with 30GiB Block PVC
@@ -289,7 +289,7 @@ After creation:
 ```bash
 # Login as ram or admin
 oc login -u ram -p ram123 https://api.ocp4.example.com:6443
-oc project banana
+oc project orange
 
 # Check VM status
 oc get vm testvm
@@ -337,7 +337,7 @@ oc describe pvc testvm-boot
 | Component | Value |
 |-----------|-------|
 | **VM Name** | testvm |
-| **Project** | banana |
+| **Project** | orange |
 | **Template** | Red Hat Enterprise Linux 9 VM |
 | **Workload Type** | Server |
 | **Flavor** | Small |
@@ -354,7 +354,7 @@ oc describe pvc testvm-boot
 | **NIC 1 Type** | masquerade |
 | **NIC 1 Model** | virtio |
 | **NIC 2 Name** | nic-0 |
-| **NIC 2 Network** | banana/database-network |
+| **NIC 2 Network** | orange/database-network |
 | **NIC 2 Type** | bridge |
 | **NIC 2 Model** | virtio |
 | **Readiness Probe** | HTTP GET /health:80 |
@@ -372,7 +372,7 @@ oc describe pvc testvm-boot
 
 ### If network interface doesn't attach:
 
-1. Verify NetworkAttachmentDefinition exists: `oc get network-attachment-definitions -n banana`
+1. Verify NetworkAttachmentDefinition exists: `oc get network-attachment-definitions -n orange`
 2. Check Multus is configured properly
 3. Verify bridge CNI plugin is available
 
@@ -388,7 +388,7 @@ oc describe pvc testvm-boot
 ## Additional Notes
 
 - The VM template may have default values that need to be adjusted
-- Ensure the `banana/database-network` NetworkAttachmentDefinition is created before adding the second NIC
+- Ensure the `orange/database-network` NetworkAttachmentDefinition is created before adding the second NIC
 - The SSH key must be the public key from `/home/student/.ssh/lab_rsa.pub`
 - Cloud-init may take a few minutes to complete after VM boot
 - The readiness probe will only pass when the HTTP service on port 80 responds successfully to `/health` endpoint
