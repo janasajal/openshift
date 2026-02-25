@@ -1,6 +1,6 @@
 # OpenShift Storage Hands-On Lab Guide
-### Red Hat OpenShift Virtualization Administration — v4.18
 **Author:** Sajal Jana
+### Red Hat OpenShift Virtualization Administration — v4.18
 
 > **Environment:** Red Hat OpenShift Virtualization Administration Rapid Track v4.18  
 > **Cluster:** 3-node (master01, master02, master03) — all running as control-plane + worker  
