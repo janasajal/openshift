@@ -34,7 +34,7 @@
 ## 1. Cluster Orientation
 
 ### Concepts
-Before touching anything network-related, orient yourself to the cluster. Every node gets an internal IP address — these are used for node-to-node communication and form the physical underlay for OVN tunnels.
+Before touching anything network-related, orient to the cluster. Every node gets an internal IP address — these are used for node-to-node communication and form the physical underlay for OVN tunnels.
 
 ### Commands
 
