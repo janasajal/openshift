@@ -1,0 +1,217 @@
+================================================================================
+  OPENSHIFT ADMINISTRATOR - SERVICE REQUEST LAB NOTES
+  OpenShift Route & Ingress Setup (External HTTPS Access)
+================================================================================
+Prepared by : Sajal Jana
+Platform    : Red Hat OpenShift Container Platform (OCP) 4.x
+Date        : May 2026
+--------------------------------------------------------------------------------
+
+OVERVIEW
+--------
+External HTTPS access was requested by the application team for their workload
+running inside OpenShift. The configuration involved Route creation with TLS
+termination, wildcard certificate setup at the IngressController level, and
+DNS coordination for the router's external IP. The following steps were carried
+out to fulfil the request.
+
+
+================================================================================
+STEP 1 — EXISTING SERVICE AND ROUTE VERIFICATION
+================================================================================
+
+Before any configuration was started, the current state of the application
+namespace was reviewed. The service backing the application was confirmed to
+be of type ClusterIP, listening on port 8080. No existing Route was found in
+the namespace.
+
+  $ oc get svc -n my-app-ns
+
+  NAME          TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)    AGE
+  my-app-svc    ClusterIP   172.30.45.112   <none>        8080/TCP   3d
+
+
+  $ oc get route -n my-app-ns
+
+  No resources found in my-app-ns namespace.
+
+
+================================================================================
+STEP 2 — EDGE-TERMINATED HTTPS ROUTE CREATION
+================================================================================
+
+An Edge-terminated Route was created for the application. In Edge termination,
+TLS is handled by the OpenShift Router (HAProxy), and traffic is forwarded to
+the pod over plain HTTP internally. This is the most commonly used TLS mode in
+enterprise environments.
+
+The --insecure-policy=Redirect flag was included so that any HTTP request on
+port 80 is automatically redirected to HTTPS port 443.
+
+  $ oc create route edge my-app-route \
+      --service=my-app-svc \
+      --hostname=myapp.example.com \
+      --cert=/path/to/tls.crt \
+      --key=/path/to/tls.key \
+      --ca-cert=/path/to/ca.crt \
+      --insecure-policy=Redirect \
+      -n my-app-ns
+
+  route.route.openshift.io/my-app-route created
+
+
+The newly created route was verified:
+
+  $ oc get route my-app-route -n my-app-ns
+
+  NAME            HOST/PORT             PATH   SERVICES      PORT    TERMINATION     WILDCARD
+  my-app-route    myapp.example.com            my-app-svc    8080    edge/Redirect   None
+
+
+================================================================================
+STEP 3 — TLS TERMINATION MODES (REFERENCE)
+================================================================================
+
+Three TLS termination modes are supported by OpenShift Routes. The appropriate
+mode was selected based on the application team's requirements.
+
+  +-------------+-----------------------------+----------------------------------+
+  | Mode        | TLS Terminates At           | Typical Use Case                 |
+  +-------------+-----------------------------+----------------------------------+
+  | Edge        | OpenShift Router            | Standard HTTPS; cert at router   |
+  | Passthrough | Application Pod             | App manages its own TLS          |
+  | Re-encrypt  | Router → re-encrypts → Pod  | End-to-end encryption required   |
+  +-------------+-----------------------------+----------------------------------+
+
+A Passthrough route was created as follows (for reference):
+
+  $ oc create route passthrough my-app-pass \
+      --service=my-app-svc \
+      --hostname=myapp.example.com \
+      -n my-app-ns
+
+  route.route.openshift.io/my-app-pass created
+
+
+A Re-encrypt route was created as follows (for reference):
+
+  $ oc create route reencrypt my-app-reenc \
+      --service=my-app-svc \
+      --hostname=myapp.example.com \
+      --cert=/path/to/tls.crt \
+      --key=/path/to/tls.key \
+      --dest-ca-cert=/path/to/pod-ca.crt \
+      -n my-app-ns
+
+  route.route.openshift.io/my-app-reenc created
+
+
+================================================================================
+STEP 4 — WILDCARD CERTIFICATE CONFIGURATION AT INGRESSCONTROLLER LEVEL
+================================================================================
+
+In the enterprise environment, a wildcard TLS certificate is configured at the
+IngressController level rather than per Route. This approach avoids managing
+individual certificates for every application Route. The existing IngressController
+was inspected first.
+
+  $ oc get ingresscontroller default \
+      -n openshift-ingress-operator -o yaml
+
+  spec:
+    defaultCertificate:
+      name: wildcard-tls-secret
+    domain: apps.example.com
+    replicas: 2
+
+
+The wildcard TLS secret was created in the openshift-ingress namespace:
+
+  $ oc create secret tls wildcard-tls-secret \
+      --cert=/path/to/wildcard.crt \
+      --key=/path/to/wildcard.key \
+      -n openshift-ingress
+
+  secret/wildcard-tls-secret created
+
+
+The IngressController was patched to reference the wildcard certificate secret:
+
+  $ oc patch ingresscontroller default \
+      -n openshift-ingress-operator \
+      --type=merge \
+      -p '{"spec":{"defaultCertificate":{"name":"wildcard-tls-secret"}}}'
+
+  ingresscontroller.operator.openshift.io/default patched
+
+
+================================================================================
+STEP 5 — DNS CONFIGURATION (ROUTER EXTERNAL IP LOOKUP)
+================================================================================
+
+The external IP address of the OpenShift Router's LoadBalancer service was
+retrieved. This IP was shared with the DNS/network team for A record or CNAME
+creation.
+
+  $ oc get svc router-default -n openshift-ingress
+
+  NAME             TYPE           CLUSTER-IP      EXTERNAL-IP      PORT(S)                      AGE
+  router-default   LoadBalancer   172.30.200.10   203.0.113.45     80:31234/TCP,443:31567/TCP   10d
+
+
+DNS record was requested to be created as follows:
+
+  Per-application DNS entry:
+    myapp.example.com  →  A  →  203.0.113.45
+
+  Wildcard DNS entry (covers all apps on the cluster):
+    *.apps.example.com  →  A  →  203.0.113.45
+
+
+================================================================================
+STEP 6 — ROUTE ADMISSION AND END-TO-END VALIDATION
+================================================================================
+
+Once DNS propagation was confirmed, the route's admission status was verified
+to ensure the OpenShift Router had accepted and is serving the route.
+
+  $ oc describe route my-app-route -n my-app-ns | grep -A5 "Ingress"
+
+  Ingress:
+    Host:           myapp.example.com
+    Router Name:    default
+    Conditions:
+      Admitted:     True
+
+
+A curl test was performed from an external client to confirm HTTPS access:
+
+  $ curl -v https://myapp.example.com
+
+  * SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384
+  * Server certificate:
+  *  subject: CN=myapp.example.com
+  *  issuer: CN=Example CA
+  * HTTP/1.1 200 OK
+
+
+================================================================================
+SUMMARY
+================================================================================
+
+The following actions were completed to fulfil the external HTTPS access request:
+
+  1. Existing service and route state was verified in the application namespace.
+  2. An Edge-terminated Route was created with HTTP-to-HTTPS redirect policy.
+  3. TLS termination modes (Edge, Passthrough, Re-encrypt) were documented
+     for reference.
+  4. A wildcard TLS secret was created and the IngressController was patched
+     to use it as the default certificate for all routes on the cluster.
+  5. The router's LoadBalancer external IP was retrieved and shared with the
+     DNS team for record creation.
+  6. Route admission and end-to-end HTTPS connectivity were validated using
+     oc describe and curl.
+
+================================================================================
+END 
+================================================================================
