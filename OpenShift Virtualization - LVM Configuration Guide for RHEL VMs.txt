@@ -1,0 +1,644 @@
+OpenShift Virtualization - LVM Configuration for RHEL VMs
+Author: Sajal Jana
+==============================================================
+
+
+OBJECTIVE
+---------
+Configure LVM on a RHEL 9 virtual machine running on OpenShift Virtualization.
+Covers manual setup, online volume expansion, and cloud-init automation.
+
+
+PRE-REQUISITES
+--------------
+- OpenShift cluster with Virtualization operator installed
+- Access to OpenShift Web Console
+- oc CLI configured and logged in
+- Sufficient storage on the cluster (CSI or OCS/ODF recommended)
+
+
+==============================================================
+METHOD 1 : MANUAL LVM SETUP
+==============================================================
+
+SCENARIO
+--------
+The database team requires a RHEL 9 VM with separate independently
+growable volumes for data, logs, and application files.
+
+
+STEP 1 - CREATE VM WITH MULTIPLE DISKS
+---------------------------------------
+In the OpenShift Web Console:
+
+  Virtualization -> VirtualMachines -> Create VirtualMachine
+  Select "RHEL 9 Server" template
+  Click "Customize VirtualMachine"
+
+Set the following:
+
+  Name      : rhel9-lvm-vm
+  CPU       : 4 cores
+  Memory    : 8 GiB
+
+Configure the root disk:
+
+  Disk name  : rootdisk
+  Size       : 30 GiB
+  Interface  : virtio
+
+Add three additional blank disks (click "Add disk" for each):
+
+  Name        Size     Purpose
+  ---------   ------   ----------------
+  data-disk   100 GiB  Database data
+  logs-disk    50 GiB  Application logs
+  app-disk     80 GiB  Application binaries
+
+  Source    : Blank (creates PVC)
+  Type      : Disk
+  Interface : virtio
+
+
+STEP 2 - CLOUD-INIT CONFIGURATION
+-----------------------------------
+Scripts tab -> Enable Cloud-init -> Edit YAML
+
+  #cloud-config
+  user: admin
+  password: redhat123
+  chpasswd: { expire: False }
+  ssh_pwauth: True
+
+
+STEP 3 - CREATE THE VM
+------------------------
+Click "Create VirtualMachine" and then "Start".
+Wait for the VM to reach Running state.
+Access it via the Console tab.
+
+
+STEP 4 - VERIFY DISKS INSIDE THE VM
+--------------------------------------
+Log in as admin, then switch to root:
+
+  [admin@rhel9-lvm-vm ~]$ sudo -i
+
+Verify block devices:
+
+  [root@rhel9-lvm-vm ~]# lsblk
+
+Expected output:
+
+  NAME   SIZE  TYPE MOUNTPOINTS
+  vda    30G   disk
+  |-vda1  1G   part /boot
+  `-vda2 29G   part /
+  vdb   100G   disk
+  vdc    50G   disk
+  vdd    80G   disk
+
+If vdb/vdc/vdd are not visible, confirm the disks were saved in the VM spec:
+
+  [root@rhel9-lvm-vm ~]# ls -la /dev/vd*
+
+
+==============================================================
+CONFIGURE DATA DISK  (/dev/vdb)
+==============================================================
+
+  [root@rhel9-lvm-vm ~]# pvcreate /dev/vdb
+  Physical volume "/dev/vdb" successfully created.
+
+  [root@rhel9-lvm-vm ~]# pvs
+  PV         VG   Fmt  Attr PSize    PFree
+  /dev/vdb        lvm2 ---  100.00g  100.00g
+
+  [root@rhel9-lvm-vm ~]# vgcreate datavg /dev/vdb
+  Volume group "datavg" successfully created
+
+  [root@rhel9-lvm-vm ~]# vgs
+  VG     #PV #LV #SN Attr   VSize    VFree
+  datavg   1   0   0 wz--n- 100.00g  100.00g
+
+  [root@rhel9-lvm-vm ~]# lvcreate -L 60G -n db_data_lv datavg
+  Logical volume "db_data_lv" created.
+
+  [root@rhel9-lvm-vm ~]# lvcreate -L 30G -n db_temp_lv datavg
+  Logical volume "db_temp_lv" created.
+
+  [root@rhel9-lvm-vm ~]# lvs
+  LV         VG     Attr       LSize
+  db_data_lv datavg -wi-a----- 60.00g
+  db_temp_lv datavg -wi-a----- 30.00g
+
+  [root@rhel9-lvm-vm ~]# mkfs.xfs /dev/datavg/db_data_lv
+  [root@rhel9-lvm-vm ~]# mkfs.xfs /dev/datavg/db_temp_lv
+
+  [root@rhel9-lvm-vm ~]# mkdir -p /sajal/data/{db,temp}
+  [root@rhel9-lvm-vm ~]# mount /dev/datavg/db_data_lv /sajal/data/db
+  [root@rhel9-lvm-vm ~]# mount /dev/datavg/db_temp_lv /sajal/data/temp
+
+  [root@rhel9-lvm-vm ~]# df -h | grep sajal
+  /dev/mapper/datavg-db_data_lv   60G   458M   60G   1%  /sajal/data/db
+  /dev/mapper/datavg-db_temp_lv   30G   234M   30G   1%  /sajal/data/temp
+
+Make mounts persistent:
+
+  [root@rhel9-lvm-vm ~]# cat >> /etc/fstab << EOF
+  /dev/mapper/datavg-db_data_lv  /sajal/data/db    xfs  defaults  0  0
+  /dev/mapper/datavg-db_temp_lv  /sajal/data/temp  xfs  defaults  0  0
+  EOF
+
+Test fstab entries before rebooting:
+
+  [root@rhel9-lvm-vm ~]# umount /sajal/data/db /sajal/data/temp
+  [root@rhel9-lvm-vm ~]# mount -a
+  [root@rhel9-lvm-vm ~]# df -h | grep sajal
+
+
+==============================================================
+CONFIGURE LOGS DISK  (/dev/vdc)
+==============================================================
+
+  [root@rhel9-lvm-vm ~]# pvcreate /dev/vdc
+  [root@rhel9-lvm-vm ~]# vgcreate logsvg /dev/vdc
+  [root@rhel9-lvm-vm ~]# lvcreate -L 40G -n app_logs_lv logsvg
+  [root@rhel9-lvm-vm ~]# lvcreate -L 10G -n sys_logs_lv logsvg
+
+  [root@rhel9-lvm-vm ~]# mkfs.xfs /dev/logsvg/app_logs_lv
+  [root@rhel9-lvm-vm ~]# mkfs.xfs /dev/logsvg/sys_logs_lv
+
+  [root@rhel9-lvm-vm ~]# mkdir -p /sajal/logs/{application,system}
+  [root@rhel9-lvm-vm ~]# mount /dev/logsvg/app_logs_lv /sajal/logs/application
+  [root@rhel9-lvm-vm ~]# mount /dev/logsvg/sys_logs_lv /sajal/logs/system
+
+  [root@rhel9-lvm-vm ~]# cat >> /etc/fstab << EOF
+  /dev/mapper/logsvg-app_logs_lv  /sajal/logs/application  xfs  defaults  0  0
+  /dev/mapper/logsvg-sys_logs_lv  /sajal/logs/system       xfs  defaults  0  0
+  EOF
+
+
+==============================================================
+CONFIGURE APPLICATION DISK  (/dev/vdd)
+==============================================================
+
+  [root@rhel9-lvm-vm ~]# pvcreate /dev/vdd
+  [root@rhel9-lvm-vm ~]# vgcreate appvg /dev/vdd
+  [root@rhel9-lvm-vm ~]# lvcreate -L 30G -n app_bin_lv appvg
+  [root@rhel9-lvm-vm ~]# lvcreate -L 10G -n app_config_lv appvg
+  [root@rhel9-lvm-vm ~]# lvcreate -L 20G -n app_cache_lv appvg
+
+  [root@rhel9-lvm-vm ~]# mkfs.xfs /dev/appvg/app_bin_lv
+  [root@rhel9-lvm-vm ~]# mkfs.xfs /dev/appvg/app_config_lv
+  [root@rhel9-lvm-vm ~]# mkfs.xfs /dev/appvg/app_cache_lv
+
+  [root@rhel9-lvm-vm ~]# mkdir -p /sajal/app/{bin,config,cache}
+  [root@rhel9-lvm-vm ~]# mount /dev/appvg/app_bin_lv    /sajal/app/bin
+  [root@rhel9-lvm-vm ~]# mount /dev/appvg/app_config_lv /sajal/app/config
+  [root@rhel9-lvm-vm ~]# mount /dev/appvg/app_cache_lv  /sajal/app/cache
+
+  [root@rhel9-lvm-vm ~]# cat >> /etc/fstab << EOF
+  /dev/mapper/appvg-app_bin_lv     /sajal/app/bin     xfs  defaults  0  0
+  /dev/mapper/appvg-app_config_lv  /sajal/app/config  xfs  defaults  0  0
+  /dev/mapper/appvg-app_cache_lv   /sajal/app/cache   xfs  defaults  0  0
+  EOF
+
+
+VERIFY FULL LVM LAYOUT
+-----------------------
+
+  [root@rhel9-lvm-vm ~]# pvs
+  PV         VG     Fmt  Attr PSize    PFree
+  /dev/vdb   datavg lvm2 a--  100.00g  10.00g
+  /dev/vdc   logsvg lvm2 a--   50.00g   0.00g
+  /dev/vdd   appvg  lvm2 a--   80.00g  20.00g
+
+  [root@rhel9-lvm-vm ~]# vgs
+  VG     #PV #LV #SN Attr   VSize    VFree
+  appvg    1   3   0 wz--n-  80.00g  20.00g
+  datavg   1   2   0 wz--n- 100.00g  10.00g
+  logsvg   1   2   0 wz--n-  50.00g   0.00g
+
+  [root@rhel9-lvm-vm ~]# lvs
+  LV             VG     Attr       LSize
+  app_bin_lv     appvg  -wi-ao----  30.00g
+  app_cache_lv   appvg  -wi-ao----  20.00g
+  app_config_lv  appvg  -wi-ao----  10.00g
+  db_data_lv     datavg -wi-ao----  60.00g
+  db_temp_lv     datavg -wi-ao----  30.00g
+  app_logs_lv    logsvg -wi-ao----  40.00g
+  sys_logs_lv    logsvg -wi-ao----  10.00g
+
+  [root@rhel9-lvm-vm ~]# df -h
+  Filesystem                          Size  Used Avail Use% Mounted on
+  /dev/mapper/datavg-db_data_lv        60G  458M   60G   1% /sajal/data/db
+  /dev/mapper/datavg-db_temp_lv        30G  234M   30G   1% /sajal/data/temp
+  /dev/mapper/logsvg-app_logs_lv       40G  321M   40G   1% /sajal/logs/application
+  /dev/mapper/logsvg-sys_logs_lv       10G  104M   10G   2% /sajal/logs/system
+  /dev/mapper/appvg-app_bin_lv         30G  245M   30G   1% /sajal/app/bin
+  /dev/mapper/appvg-app_config_lv      10G   97M   10G   1% /sajal/app/config
+  /dev/mapper/appvg-app_cache_lv       20G  178M   20G   1% /sajal/app/cache
+
+Reboot and confirm all mounts come back:
+
+  [root@rhel9-lvm-vm ~]# reboot
+
+  [root@rhel9-lvm-vm ~]# df -h
+  [root@rhel9-lvm-vm ~]# lvs
+
+
+==============================================================
+METHOD 2 : EXTENDING VOLUMES (ONLINE)
+==============================================================
+
+SCENARIO
+--------
+The db_data_lv volume is running low on space. The underlying PVC
+needs to be expanded from the OpenShift side, then the filesystem
+resized online without unmounting.
+
+
+STEP 1 - EXPAND THE PVC IN OPENSHIFT
+--------------------------------------
+In the OpenShift Web Console:
+
+  Virtualization -> VirtualMachines -> rhel9-lvm-vm
+  Disks tab -> Click data-disk -> Edit
+  Change size : 100 GiB -> 150 GiB
+  Click Save
+
+Wait for the PVC resize to complete. Confirm in:
+
+  Storage -> PersistentVolumeClaims -> data-disk
+  Status should return to "Bound"
+
+
+STEP 2 - RESIZE THE PV INSIDE THE VM
+--------------------------------------
+
+  [root@rhel9-lvm-vm ~]# pvs
+  PV         VG     Fmt  Attr PSize    PFree
+  /dev/vdb   datavg lvm2 a--  100.00g  10.00g
+
+  [root@rhel9-lvm-vm ~]# pvresize /dev/vdb
+  Physical volume "/dev/vdb" changed
+  1 physical volume(s) resized or updated / 0 physical volume(s) not resized
+
+  [root@rhel9-lvm-vm ~]# pvs
+  PV         VG     Fmt  Attr PSize    PFree
+  /dev/vdb   datavg lvm2 a--  150.00g  60.00g
+
+
+STEP 3 - EXTEND THE LOGICAL VOLUME
+------------------------------------
+
+  [root@rhel9-lvm-vm ~]# lvextend -L +40G /dev/datavg/db_data_lv
+  Size of logical volume datavg/db_data_lv changed from 60.00 GiB to 100.00 GiB.
+  Logical volume datavg/db_data_lv successfully resized.
+
+  [root@rhel9-lvm-vm ~]# lvs
+  LV         VG     Attr       LSize
+  db_data_lv datavg -wi-ao---- 100.00g
+  db_temp_lv datavg -wi-ao----  30.00g
+
+
+STEP 4 - GROW THE XFS FILESYSTEM ONLINE
+-----------------------------------------
+
+  [root@rhel9-lvm-vm ~]# xfs_growfs /sajal/data/db
+  meta-data=/dev/mapper/datavg-db_data_lv  isize=512  agcount=4, agsize=3932160 blks
+           =                               sectsz=512 attr=2, projid32bit=1
+  data     =                               bsize=4096 blocks=15728640, imaxpct=25
+  naming   =version 2                      bsize=4096 ascii-ci=0, ftype=1
+  log      =internal                       bsize=4096 blocks=7680, version=2
+  realtime =none                           extsz=4096 blocks=0, rtextents=0
+  data blocks changed from 15728640 to 26214400
+
+  [root@rhel9-lvm-vm ~]# df -h /sajal/data/db
+  Filesystem                      Size  Used Avail Use% Mounted on
+  /dev/mapper/datavg-db_data_lv   100G  458M  100G   1% /sajal/data/db
+
+No unmount required. Filesystem was resized while mounted.
+
+
+==============================================================
+METHOD 3 : CLOUD-INIT AUTOMATION
+==============================================================
+
+SCENARIO
+--------
+Automate basic LVM setup at VM boot time using cloud-init.
+Suitable for single-disk LVM configurations.
+
+During VM creation, Scripts tab -> Cloud-init -> Edit YAML:
+
+  #cloud-config
+  user: admin
+  password: redhat123
+  chpasswd: { expire: False }
+  ssh_pwauth: True
+
+  bootcmd:
+    - [ cloud-init-per, once, pvcreatevdb, pvcreate, /dev/vdb ]
+    - [ cloud-init-per, once, vgcreatedata, vgcreate, datavg, /dev/vdb ]
+    - [ cloud-init-per, once, lvcreatedb, lvcreate, -L, 60G, -n, db_data_lv, datavg ]
+    - [ cloud-init-per, once, mkfsdb, mkfs.xfs, /dev/datavg/db_data_lv ]
+
+  mounts:
+    - [ /dev/datavg/db_data_lv, /sajal/data/db, xfs, "defaults", "0", "0" ]
+
+  runcmd:
+    - mkdir -p /sajal/data/db
+    - mount -a
+
+Note: cloud-init bootcmd runs before disk mounts. Ensure the target
+mount point directory exists via runcmd or the mounts directive.
+For multi-disk LVM setups, use a post-provisioning script instead.
+
+
+==============================================================
+COMMON OPERATIONS
+==============================================================
+
+ADD A NEW DISK TO AN EXISTING VOLUME GROUP
+-------------------------------------------
+After adding the disk via the OpenShift Console:
+
+  [root@rhel9-lvm-vm ~]# lsblk
+  # Identify new disk, e.g. /dev/vde
+
+  [root@rhel9-lvm-vm ~]# pvcreate /dev/vde
+  [root@rhel9-lvm-vm ~]# vgextend datavg /dev/vde
+
+  [root@rhel9-lvm-vm ~]# vgs datavg
+  VG     #PV #LV #SN Attr   VSize    VFree
+  datavg   2   2   0 wz--n- 250.00g  90.00g
+
+  [root@rhel9-lvm-vm ~]# lvextend -L +50G /dev/datavg/db_data_lv
+  [root@rhel9-lvm-vm ~]# xfs_growfs /sajal/data/db
+
+
+CREATE AND USE AN LVM SNAPSHOT
+--------------------------------
+
+  [root@rhel9-lvm-vm ~]# lvcreate -L 10G -s -n db_data_snap /dev/datavg/db_data_lv
+  Logical volume "db_data_snap" created.
+
+Mount snapshot read-only for backup:
+
+  [root@rhel9-lvm-vm ~]# mkdir /mnt/snapshot
+  [root@rhel9-lvm-vm ~]# mount -o ro /dev/datavg/db_data_snap /mnt/snapshot
+  [root@rhel9-lvm-vm ~]# tar czf /sajal/backup/db-$(date +%Y%m%d).tar.gz /mnt/snapshot
+
+Rollback if something went wrong:
+
+  [root@rhel9-lvm-vm ~]# umount /mnt/snapshot
+  [root@rhel9-lvm-vm ~]# lvconvert --merge /dev/datavg/db_data_snap
+
+Remove snapshot after confirming success:
+
+  [root@rhel9-lvm-vm ~]# umount /mnt/snapshot
+  [root@rhel9-lvm-vm ~]# lvremove /dev/datavg/db_data_snap
+
+
+==============================================================
+TROUBLESHOOTING
+==============================================================
+
+ISSUE: "Device is already in use" during pvcreate
+CAUSE: Disk has existing partition table or filesystem signature.
+FIX  :
+
+  [root@rhel9-lvm-vm ~]# wipefs -a /dev/vdb
+  [root@rhel9-lvm-vm ~]# pvcreate /dev/vdb
+
+
+ISSUE: Logical volumes not visible after reboot
+CAUSE: Volume group not activated automatically.
+FIX  :
+
+  [root@rhel9-lvm-vm ~]# vgchange -ay
+  [root@rhel9-lvm-vm ~]# mount -a
+
+Permanent fix: Verify /etc/fstab uses /dev/mapper paths:
+
+  /dev/mapper/datavg-db_data_lv  /sajal/data/db  xfs  defaults  0  0
+
+
+ISSUE: "Insufficient free space" when creating or extending LV
+CAUSE: VG does not have enough free extents.
+CHECK:
+
+  [root@rhel9-lvm-vm ~]# vgs datavg
+
+FIX  : Expand existing PVC in OpenShift and run pvresize,
+        or add a new disk and run vgextend.
+
+
+ISSUE: Cannot shrink XFS filesystem
+CAUSE: XFS does not support online or offline shrink.
+FIX  : If a smaller volume is required - backup data, recreate
+        the LV at the smaller size, reformat, restore data.
+        Use ext4 if filesystem shrink is a firm requirement.
+
+
+==============================================================
+PRODUCTION EXAMPLE : POSTGRESQL DATABASE SERVER
+==============================================================
+
+VM DISK LAYOUT
+--------------
+
+  Disk     Size    Purpose
+  ------   ------  -----------------------
+  rootdisk  30 GiB OS
+  /dev/vdb 200 GiB Database data and index
+  /dev/vdc 100 GiB Write-ahead logs (WAL)
+  /dev/vdd 300 GiB Backups
+  /dev/vde  50 GiB Temp files
+
+
+LVM SETUP
+---------
+
+  [root@rhel9-lvm-vm ~]# pvcreate /dev/vdb
+  [root@rhel9-lvm-vm ~]# vgcreate pgdata_vg /dev/vdb
+  [root@rhel9-lvm-vm ~]# lvcreate -L 150G -n pg_data_lv pgdata_vg
+  [root@rhel9-lvm-vm ~]# lvcreate -L  30G -n pg_index_lv pgdata_vg
+
+  [root@rhel9-lvm-vm ~]# pvcreate /dev/vdc
+  [root@rhel9-lvm-vm ~]# vgcreate pgwal_vg /dev/vdc
+  [root@rhel9-lvm-vm ~]# lvcreate -L 80G -n pg_wal_lv pgwal_vg
+
+  [root@rhel9-lvm-vm ~]# pvcreate /dev/vdd
+  [root@rhel9-lvm-vm ~]# vgcreate pgbackup_vg /dev/vdd
+  [root@rhel9-lvm-vm ~]# lvcreate -L 250G -n pg_backup_lv pgbackup_vg
+
+  [root@rhel9-lvm-vm ~]# pvcreate /dev/vde
+  [root@rhel9-lvm-vm ~]# vgcreate pgtemp_vg /dev/vde
+  [root@rhel9-lvm-vm ~]# lvcreate -L 40G -n pg_temp_lv pgtemp_vg
+
+Format all volumes:
+
+  [root@rhel9-lvm-vm ~]# mkfs.xfs /dev/pgdata_vg/pg_data_lv
+  [root@rhel9-lvm-vm ~]# mkfs.xfs /dev/pgdata_vg/pg_index_lv
+  [root@rhel9-lvm-vm ~]# mkfs.xfs /dev/pgwal_vg/pg_wal_lv
+  [root@rhel9-lvm-vm ~]# mkfs.xfs /dev/pgbackup_vg/pg_backup_lv
+  [root@rhel9-lvm-vm ~]# mkfs.xfs /dev/pgtemp_vg/pg_temp_lv
+
+Create mount points and mount:
+
+  [root@rhel9-lvm-vm ~]# mkdir -p /var/lib/pgsql/{data,index,wal}
+  [root@rhel9-lvm-vm ~]# mkdir -p /sajal/backup/postgresql
+  [root@rhel9-lvm-vm ~]# mkdir -p /tmp/pgsql
+
+  [root@rhel9-lvm-vm ~]# mount /dev/pgdata_vg/pg_data_lv    /var/lib/pgsql/data
+  [root@rhel9-lvm-vm ~]# mount /dev/pgdata_vg/pg_index_lv   /var/lib/pgsql/index
+  [root@rhel9-lvm-vm ~]# mount /dev/pgwal_vg/pg_wal_lv      /var/lib/pgsql/wal
+  [root@rhel9-lvm-vm ~]# mount /dev/pgbackup_vg/pg_backup_lv /sajal/backup/postgresql
+  [root@rhel9-lvm-vm ~]# mount /dev/pgtemp_vg/pg_temp_lv    /tmp/pgsql
+
+Update /etc/fstab:
+
+  [root@rhel9-lvm-vm ~]# cat >> /etc/fstab << EOF
+  /dev/pgdata_vg/pg_data_lv      /var/lib/pgsql/data          xfs  defaults  0  0
+  /dev/pgdata_vg/pg_index_lv     /var/lib/pgsql/index         xfs  defaults  0  0
+  /dev/pgwal_vg/pg_wal_lv        /var/lib/pgsql/wal           xfs  defaults  0  0
+  /dev/pgbackup_vg/pg_backup_lv  /sajal/backup/postgresql     xfs  defaults  0  0
+  /dev/pgtemp_vg/pg_temp_lv      /tmp/pgsql                   xfs  defaults  0  0
+  EOF
+
+Set ownership:
+
+  [root@rhel9-lvm-vm ~]# chown -R postgres:postgres /var/lib/pgsql /tmp/pgsql
+  [root@rhel9-lvm-vm ~]# chmod 700 /var/lib/pgsql/data
+
+
+SNAPSHOT-BASED BACKUP FOR POSTGRESQL
+--------------------------------------
+
+  [root@rhel9-lvm-vm ~]# lvcreate -L 10G -s -n pg_data_snap /dev/pgdata_vg/pg_data_lv
+
+  [root@rhel9-lvm-vm ~]# mkdir /mnt/pg_snapshot
+  [root@rhel9-lvm-vm ~]# mount -o ro /dev/pgdata_vg/pg_data_snap /mnt/pg_snapshot
+  [root@rhel9-lvm-vm ~]# tar czf /sajal/backup/postgresql/pgdata-$(date +%Y%m%d).tar.gz /mnt/pg_snapshot
+
+  [root@rhel9-lvm-vm ~]# umount /mnt/pg_snapshot
+  [root@rhel9-lvm-vm ~]# lvremove -y /dev/pgdata_vg/pg_data_snap
+
+
+==============================================================
+QUICK REFERENCE - LVM COMMAND SUMMARY
+==============================================================
+
+PHYSICAL VOLUME (PV)
+
+  pvcreate /dev/vdX            Initialize disk for LVM
+  pvs                          Summary view
+  pvdisplay                    Detailed view
+  pvresize /dev/vdX            Rescan after PVC expansion in OpenShift
+
+VOLUME GROUP (VG)
+
+  vgcreate vgname /dev/vdX     Create volume group
+  vgs                          Summary view
+  vgdisplay                    Detailed view
+  vgextend vgname /dev/vdX     Add disk to existing VG
+  vgchange -ay                 Activate all VGs (useful after reboot issue)
+
+LOGICAL VOLUME (LV)
+
+  lvcreate -L 10G -n lvname vgname     Create LV with fixed size
+  lvcreate -l 100%FREE -n lvname vg    Create LV using all free space
+  lvs                                  Summary view
+  lvdisplay                            Detailed view
+  lvextend -L +10G /dev/vg/lv          Extend LV by 10G
+  lvextend -l +100%FREE /dev/vg/lv     Extend LV using all remaining free space
+  lvremove /dev/vg/lv                  Remove LV
+
+FILESYSTEM
+
+  mkfs.xfs /dev/vg/lv                  Format as XFS
+  mkfs.ext4 /dev/vg/lv                 Format as ext4
+  xfs_growfs /mountpoint               Grow XFS filesystem (online)
+  resize2fs /dev/vg/lv                 Grow or shrink ext4 filesystem
+
+SNAPSHOTS
+
+  lvcreate -L 10G -s -n snapname /dev/vg/lv    Create snapshot
+  lvremove /dev/vg/snapname                     Remove snapshot
+  lvconvert --merge /dev/vg/snapname            Rollback to snapshot
+
+
+==============================================================
+BEST PRACTICES
+==============================================================
+
+NAMING CONVENTIONS
+
+  Volume Groups  : datavg, logsvg, appvg, pgdata_vg
+  Logical Volumes: db_data_lv, app_logs_lv, pg_wal_lv
+
+  Avoid generic names like vg00, vg01, lv1. They provide no context
+  when troubleshooting at 2 AM.
+
+FREE SPACE IN VOLUME GROUPS
+
+  Do not allocate 100% of VG capacity. Reserve 10-20% for:
+  - LVM snapshots
+  - Emergency expansion without adding new disks
+  - Metadata overhead
+
+FILESYSTEM SELECTION
+
+  Use XFS for:
+  - Database data and index files
+  - High-throughput workloads
+  - Large sequential I/O (WAL, backup)
+
+  Use ext4 for:
+  - General-purpose volumes where shrink may be needed
+  - Smaller volumes with mixed small-file workloads
+
+  XFS cannot be shrunk. Plan volume sizes accordingly.
+
+SEPARATE VGS FOR DIFFERENT WORKLOADS
+
+  Keep database data, logs, and application binaries in separate
+  volume groups. This provides:
+  - Independent expansion per workload
+  - Simplified troubleshooting
+  - No contention on free extents between workloads
+
+FSTAB PATHS
+
+  Always use /dev/mapper/vgname-lvname paths in /etc/fstab.
+  Device names like /dev/vdb can change after reboot.
+  Mapper paths are stable.
+
+MONITORING
+
+  Check VG free space weekly:
+    vgs
+
+  Check LV usage weekly:
+    lvs
+
+  Check filesystem usage daily:
+    df -h
+
+  Set alerts when VG free space drops below 20% or LV
+  utilisation exceeds 80%.
+
+SNAPSHOT DISCIPLINE
+
+  Create a snapshot before any significant change to the volume
+  (OS upgrade, schema migration, application update).
+  Remove the snapshot promptly after confirming success.
+  Snapshots consume VG free space as data changes.
+
+
+==============================================================
+End 
+==============================================================
