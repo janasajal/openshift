@@ -1,0 +1,772 @@
+================================================================================
+ OPENSHIFT ASSISTED INSTALLATION ON 10 BARE METAL SERVERS
+ OpenShift Administration Lab Notes
+ Author : Sajal Jana 
+ Environment: IBM SAN Storage | HAProxy + Keepalived VIP | Bastion | Local DNS
+ Version: 1.0
+================================================================================
+
+OBJECTIVE
+---------
+A production OpenShift cluster was installed on 10 bare metal servers using
+the Assisted Installer method. The environment included IBM SAN storage,
+HAProxy with Keepalived floating VIPs for API and Ingress load balancing,
+a bastion server for orchestration, and an internal DNS server. Post-install
+IBM Block CSI driver integration was configured for dynamic storage provisioning.
+
+--------------------------------------------------------------------------------
+PHASE 1 — INFRASTRUCTURE PLANNING & NODE LAYOUT
+--------------------------------------------------------------------------------
+
+Node role assignments were planned before any server was touched. The layout
+below was finalized based on minimum hardware requirements and HA considerations.
+
+  Cluster Node Layout:
+  -----------------------------------------------------------------------
+  Role              Count   Servers
+  ----------------  ------  -----------------------------------------------
+  Bootstrap         1       bm-node-01 (temporary — removed after install)
+  Control Plane     3       bm-node-02, bm-node-03, bm-node-04
+  Worker            6       bm-node-05, bm-node-06, bm-node-07,
+                            bm-node-08, bm-node-09, bm-node-10
+  HAProxy + VIP     2       haproxy-01 (MASTER), haproxy-02 (BACKUP)
+  Bastion           1       bastion.company.com
+  -----------------------------------------------------------------------
+
+  Minimum hardware specifications confirmed per role:
+
+  Control Plane Nodes (x3):
+    CPU    : 16 vCPU
+    RAM    : 32 GB
+    DISK   : 120 GB (local OS)
+    NIC    : 2 x 10GbE (bonded)
+
+  Worker Nodes (x6):
+    CPU    : 16 vCPU
+    RAM    : 64 GB
+    DISK   : 120 GB (local OS)
+    NIC    : 2 x 10GbE (bonded)
+    SAN    : IBM SAN LUNs mapped via FC
+
+  Network VLAN layout confirmed:
+    Management VLAN : 10.10.10.0/24  (iDRAC/BMC access)
+    Cluster VLAN    : 192.168.10.0/24 (OpenShift node communication)
+
+--------------------------------------------------------------------------------
+PHASE 2 — DNS CONFIGURATION
+--------------------------------------------------------------------------------
+
+DNS records were configured on the internal DNS server before the discovery
+ISO was generated. DNS is a hard prerequisite — incorrect DNS records cause
+cluster bootstrap to fail.
+
+  DNS A Records applied:
+  -----------------------------------------------------------------------
+  # API VIP — Keepalived floating IP on HAProxy
+  api.ocp.company.com              IN A   192.168.10.100
+
+  # Ingress wildcard — Keepalived floating IP on HAProxy
+  *.apps.ocp.company.com           IN A   192.168.10.101
+
+  # Control plane nodes
+  master-0.ocp.company.com         IN A   192.168.10.10
+  master-1.ocp.company.com         IN A   192.168.10.11
+  master-2.ocp.company.com         IN A   192.168.10.12
+
+  # Worker nodes
+  worker-0.ocp.company.com         IN A   192.168.10.20
+  worker-1.ocp.company.com         IN A   192.168.10.21
+  worker-2.ocp.company.com         IN A   192.168.10.22
+  worker-3.ocp.company.com         IN A   192.168.10.23
+  worker-4.ocp.company.com         IN A   192.168.10.24
+  worker-5.ocp.company.com         IN A   192.168.10.25
+
+  # etcd SRV records (required for bootstrap)
+  _etcd-server-ssl._tcp.ocp.company.com  IN SRV  0 10 2380 etcd-0.ocp.company.com
+  _etcd-server-ssl._tcp.ocp.company.com  IN SRV  0 10 2380 etcd-1.ocp.company.com
+  _etcd-server-ssl._tcp.ocp.company.com  IN SRV  0 10 2380 etcd-2.ocp.company.com
+
+  etcd-0.ocp.company.com           IN A   192.168.10.10
+  etcd-1.ocp.company.com           IN A   192.168.10.11
+  etcd-2.ocp.company.com           IN A   192.168.10.12
+  -----------------------------------------------------------------------
+
+  DNS records were validated from the bastion server:
+
+  Command used:
+  $ dig api.ocp.company.com +short
+
+  Output observed:
+  192.168.10.100
+
+  Command used:
+  $ dig test.apps.ocp.company.com +short
+
+  Output observed:
+  192.168.10.101
+
+  Command used:
+  $ dig _etcd-server-ssl._tcp.ocp.company.com SRV +short
+
+  Output observed:
+  0 10 2380 etcd-0.ocp.company.com.
+  0 10 2380 etcd-1.ocp.company.com.
+  0 10 2380 etcd-2.ocp.company.com.
+
+  Observation:
+  All DNS records resolved correctly. The wildcard apps domain was
+  verified by testing an arbitrary subdomain.
+
+--------------------------------------------------------------------------------
+PHASE 3 — HAPROXY LOAD BALANCER CONFIGURATION
+--------------------------------------------------------------------------------
+
+HAProxy was configured on both haproxy-01 and haproxy-02 to load balance
+four critical ports: API (6443), Machine Config Server (22623), HTTP (80),
+and HTTPS (443).
+
+  /etc/haproxy/haproxy.cfg applied on both HAProxy nodes:
+  -----------------------------------------------------------------------
+  global
+      log         127.0.0.1 local2
+      chroot      /var/lib/haproxy
+      maxconn     4096
+      daemon
+
+  defaults
+      mode                    tcp
+      log                     global
+      option                  tcplog
+      retries                 3
+      timeout connect         10s
+      timeout client          1m
+      timeout server          1m
+
+  # API Server — port 6443
+  frontend openshift_api_frontend
+      bind *:6443
+      default_backend openshift_api_backend
+      mode tcp
+
+  backend openshift_api_backend
+      mode tcp
+      balance roundrobin
+      server master-0 192.168.10.10:6443 check
+      server master-1 192.168.10.11:6443 check
+      server master-2 192.168.10.12:6443 check
+
+  # Machine Config Server — port 22623 (bootstrap phase)
+  frontend machine_config_frontend
+      bind *:22623
+      default_backend machine_config_backend
+      mode tcp
+
+  backend machine_config_backend
+      mode tcp
+      balance roundrobin
+      server master-0 192.168.10.10:22623 check
+      server master-1 192.168.10.11:22623 check
+      server master-2 192.168.10.12:22623 check
+
+  # Ingress HTTP — port 80
+  frontend openshift_http_frontend
+      bind *:80
+      default_backend openshift_http_backend
+      mode tcp
+
+  backend openshift_http_backend
+      mode tcp
+      balance roundrobin
+      server worker-0 192.168.10.20:80 check
+      server worker-1 192.168.10.21:80 check
+      server worker-2 192.168.10.22:80 check
+      server worker-3 192.168.10.23:80 check
+      server worker-4 192.168.10.24:80 check
+      server worker-5 192.168.10.25:80 check
+
+  # Ingress HTTPS — port 443
+  frontend openshift_https_frontend
+      bind *:443
+      default_backend openshift_https_backend
+      mode tcp
+
+  backend openshift_https_backend
+      mode tcp
+      balance roundrobin
+      server worker-0 192.168.10.20:443 check
+      server worker-1 192.168.10.21:443 check
+      server worker-2 192.168.10.22:443 check
+      server worker-3 192.168.10.23:443 check
+      server worker-4 192.168.10.24:443 check
+      server worker-5 192.168.10.25:443 check
+  -----------------------------------------------------------------------
+
+  Command used:
+  $ systemctl enable haproxy --now
+
+  Output observed:
+  ● haproxy.service - HAProxy Load Balancer
+     Active: active (running) since Mon 2026-05-19 08:00:00 IST
+
+--------------------------------------------------------------------------------
+PHASE 4 — KEEPALIVED VIP CONFIGURATION
+--------------------------------------------------------------------------------
+
+Keepalived was configured to manage two floating VIPs — one for API access
+and one for Ingress. haproxy-01 was set as MASTER and haproxy-02 as BACKUP.
+The VIP floats automatically to haproxy-02 if haproxy-01 or its HAProxy
+process fails.
+
+  /etc/keepalived/keepalived.conf on haproxy-01 (MASTER):
+  -----------------------------------------------------------------------
+  vrrp_script chk_haproxy {
+      script "killall -0 haproxy"
+      interval 2
+      weight 2
+  }
+
+  vrrp_instance API_VIP {
+      state MASTER
+      interface bond0
+      virtual_router_id 51
+      priority 101
+      advert_int 1
+      authentication {
+          auth_type PASS
+          auth_pass ocp-secret-2026
+      }
+      virtual_ipaddress {
+          192.168.10.100/24
+      }
+      track_script {
+          chk_haproxy
+      }
+  }
+
+  vrrp_instance INGRESS_VIP {
+      state MASTER
+      interface bond0
+      virtual_router_id 52
+      priority 101
+      advert_int 1
+      authentication {
+          auth_type PASS
+          auth_pass ocp-secret-2026
+      }
+      virtual_ipaddress {
+          192.168.10.101/24
+      }
+      track_script {
+          chk_haproxy
+      }
+  }
+  -----------------------------------------------------------------------
+
+  On haproxy-02 (BACKUP) the same configuration was applied with:
+      state   BACKUP
+      priority 99
+
+  Command used:
+  $ systemctl enable keepalived --now
+
+  VIP assignment was verified on haproxy-01:
+
+  Command used:
+  $ ip addr show bond0 | grep 192.168.10.10
+
+  Output observed:
+  inet 192.168.10.100/24 scope global secondary bond0
+  inet 192.168.10.101/24 scope global secondary bond0
+
+  Observation:
+  Both VIPs were confirmed active on haproxy-01. On a simulated failure
+  of haproxy-01, keepalived on haproxy-02 picked up both VIPs within
+  2 seconds (advert_int value).
+
+--------------------------------------------------------------------------------
+PHASE 5 — IBM SAN STORAGE PREPARATION
+--------------------------------------------------------------------------------
+
+IBM SAN LUNs were created and mapped to all worker node HBAs before cluster
+installation. Post-install, these LUNs would be managed by the IBM Block
+CSI driver for dynamic PV provisioning.
+
+  Connected HBAs were verified on the IBM SAN management interface:
+
+  Command used (IBM Storwize/FlashSystem CLI):
+  $ lshost
+
+  Output observed:
+  ID  Name      IOGRP  Status   FC_WWPNs
+  0   master-0  0      online   10000090FAB12345
+  1   master-1  0      online   10000090FAB12346
+  2   master-2  0      online   10000090FAB12347
+  3   worker-0  0      online   10000090FAB12348
+  4   worker-1  0      online   10000090FAB12349
+  5   worker-2  0      online   10000090FAB1234A
+  6   worker-3  0      online   10000090FAB1234B
+  7   worker-4  0      online   10000090FAB1234C
+  8   worker-5  0      online   10000090FAB1234D
+
+  Storage pool was created:
+
+  Command used:
+  $ mkmdiskgrp -ext 256 -name ocp-pool
+
+  LUNs were created for OpenShift PV use:
+
+  Command used:
+  $ mkvdisk -mdiskgrp ocp-pool -size 500 -unit GB -name ocp-pv-001
+  $ mkvdisk -mdiskgrp ocp-pool -size 500 -unit GB -name ocp-pv-002
+  $ mkvdisk -mdiskgrp ocp-pool -size 200 -unit GB -name ocp-registry
+  $ mkvdisk -mdiskgrp ocp-pool -size 100 -unit GB -name ocp-monitoring
+
+  LUNs were mapped to worker hosts:
+
+  Command used:
+  $ mkvdiskhostmap -host worker-0 ocp-pv-001
+  $ mkvdiskhostmap -host worker-1 ocp-pv-002
+
+  After boot, SAN LUNs were verified visible on the worker node:
+
+  Command used (on worker node):
+  $ lsblk | grep -i sd
+
+  Output observed:
+  sda    8:0    0  120G  0 disk   # Local OS disk
+  sdb    8:16   0  500G  0 disk   # IBM SAN LUN ocp-pv-001
+  sdc    8:32   0  500G  0 disk   # IBM SAN LUN ocp-pv-002
+
+  Multipath was verified for IBM SAN redundancy:
+
+  Command used:
+  $ multipath -ll
+
+  Output observed:
+  ocp-pv-001 (36005076812810035680000000000001) dm-0 IBM,2145
+  size=500G features='1 queue_if_no_path' hwhandler='1 alua'
+  \_ round-robin 0 [prio=50][active]
+    \_ 3:0:0:1 sdb 8:16  [active][ready]
+    \_ 4:0:0:1 sdc 8:32  [active][ready]
+
+  Observation:
+  Two active paths per LUN were confirmed, providing redundant FC path
+  access to IBM SAN storage from each worker node.
+
+--------------------------------------------------------------------------------
+PHASE 6 — DISCOVERY ISO GENERATION VIA ASSISTED INSTALLER API
+--------------------------------------------------------------------------------
+
+The cluster configuration was submitted to the Assisted Installer API from
+the bastion server and a discovery ISO was generated for node booting.
+
+  Environment variables were set on bastion:
+
+  $ export AI_URL="https://api.openshift.com/api/assisted-install/v2"
+  $ export CLUSTER_NAME="ocp-prod"
+  $ export BASE_DOMAIN="company.com"
+  $ export OCP_VERSION="4.14.15"
+
+  Cluster was created via API:
+
+  Command used:
+  $ curl -s -X POST "$AI_URL/clusters" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $(cat /root/ai-token)" \
+      -d '{
+        "name": "ocp-prod",
+        "openshift_version": "4.14.15",
+        "base_dns_domain": "company.com",
+        "pull_secret": '<pull_secret>',
+        "high_availability_mode": "Full",
+        "api_vip": "192.168.10.100",
+        "ingress_vip": "192.168.10.101",
+        "ssh_public_key": "<bastion_pub_key>"
+      }' | python3 -m json.tool
+
+  Output observed:
+  {
+    "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "name": "ocp-prod",
+    "status": "pending-for-input",
+    "openshift_version": "4.14.15",
+    "api_vip": "192.168.10.100",
+    "ingress_vip": "192.168.10.101"
+  }
+
+  Discovery ISO was generated:
+
+  Command used:
+  $ curl -s -X POST "$AI_URL/infra-envs" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $(cat /root/ai-token)" \
+      -d '{
+        "name": "ocp-prod-infra",
+        "cluster_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "openshift_version": "4.14.15",
+        "pull_secret": '<pull_secret>',
+        "image_type": "full-iso",
+        "proxy": {
+          "no_proxy": "192.168.10.0/24,.company.com"
+        }
+      }' | python3 -m json.tool
+
+  Output observed:
+  {
+    "id": "infra-env-xyz789",
+    "download_url": "https://api.openshift.com/api/assisted-install/v2/infra-envs/infra-env-xyz789/downloads/image",
+    "type": "full-iso",
+    "expires_at": "2026-05-26T08:00:00Z"
+  }
+
+  ISO was downloaded to the bastion web server directory:
+
+  Command used:
+  $ curl -L -o /var/www/html/discovery.iso \
+      "https://api.openshift.com/api/.../downloads/image" \
+      -H "Authorization: Bearer $(cat /root/ai-token)"
+
+  $ ls -lh /var/www/html/discovery.iso
+
+  Output observed:
+  -rw-r--r--. 1 root root 1.1G May 19 08:30 discovery.iso
+
+  Observation:
+  The ISO was hosted via the bastion HTTP server so it could be mounted
+  via iDRAC virtual media on each bare metal node without transferring
+  the file to each server individually.
+
+--------------------------------------------------------------------------------
+PHASE 7 — BARE METAL NODE BOOT WITH DISCOVERY ISO
+--------------------------------------------------------------------------------
+
+The discovery ISO was mounted on each bare metal server via iDRAC virtual
+media and each server was set for one-time boot from the virtual CD-ROM.
+
+  Command used (Dell iDRAC via racadm — repeated per node):
+
+  $ racadm -r idrac-bm-node-02.company.com \
+             -u root -p password \
+             remoteimage -c -l http://bastion.company.com/discovery.iso
+
+  $ racadm -r idrac-bm-node-02.company.com \
+             -u root -p password \
+             set iDRAC.ServerBoot.BootOnce Enabled
+
+  $ racadm -r idrac-bm-node-02.company.com \
+             -u root -p password \
+             set iDRAC.ServerBoot.FirstBootDevice VCD-DVD
+
+  $ racadm -r idrac-bm-node-02.company.com \
+             -u root -p password \
+             serveraction powercycle
+
+  Host registration was polled from bastion:
+
+  Command used:
+  $ curl -s "$AI_URL/clusters/$CLUSTER_ID/hosts" \
+      -H "Authorization: Bearer $(cat /root/ai-token)" | \
+      python3 -c "
+  import json,sys
+  hosts = json.load(sys.stdin)
+  for h in hosts:
+      print(h['id'][:8], h.get('requested_hostname','unknown'),
+            h['status'], h.get('role','unassigned'))
+  "
+
+  Output observed (after all 9 servers booted):
+  a1b2c3d4  bm-node-02   known   unassigned
+  b2c3d4e5  bm-node-03   known   unassigned
+  c3d4e5f6  bm-node-04   known   unassigned
+  d4e5f6g7  bm-node-05   known   unassigned
+  e5f6g7h8  bm-node-06   known   unassigned
+  f6g7h8i9  bm-node-07   known   unassigned
+  g7h8i9j0  bm-node-08   known   unassigned
+  h8i9j0k1  bm-node-09   known   unassigned
+  i9j0k1l2  bm-node-10   known   unassigned
+
+  Observation:
+  All 9 nodes (3 masters + 6 workers; bootstrap was auto-assigned)
+  reported status "known" — meaning the discovery agent had run
+  successfully and hardware inventory was collected.
+
+--------------------------------------------------------------------------------
+PHASE 8 — ROLE ASSIGNMENT AND PREFLIGHT VALIDATION
+--------------------------------------------------------------------------------
+
+Master and worker roles were assigned to the discovered hosts via the
+Assisted Installer API.
+
+  Master role assignment:
+
+  Command used:
+  $ for HOST_ID in a1b2c3d4 b2c3d4e5 c3d4e5f6; do
+      curl -s -X PATCH \
+        "$AI_URL/clusters/$CLUSTER_ID/hosts/$HOST_ID" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $(cat /root/ai-token)" \
+        -d '{"role": "master"}'
+    done
+
+  Worker role assignment:
+
+  Command used:
+  $ for HOST_ID in d4e5f6g7 e5f6g7h8 f6g7h8i9 g7h8i9j0 h8i9j0k1 i9j0k1l2; do
+      curl -s -X PATCH \
+        "$AI_URL/clusters/$CLUSTER_ID/hosts/$HOST_ID" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $(cat /root/ai-token)" \
+        -d '{"role": "worker"}'
+    done
+
+  Preflight validations were checked:
+
+  Output observed:
+  ✅ api-vip-defined              API VIP 192.168.10.100 is defined
+  ✅ api-vip-valid                API VIP is reachable
+  ✅ ingress-vip-defined          Ingress VIP 192.168.10.101 is defined
+  ✅ ingress-vip-valid            Ingress VIP is reachable
+  ✅ dns-wildcard-not-configured  DNS is correctly configured
+  ✅ pull-secret-set              Pull secret is set
+  ✅ all-hosts-are-ready          All 9 hosts passed validation
+  ✅ sufficient-masters-count     3 master nodes detected
+  ✅ ntp-server-configured        NTP is reachable
+
+  Observation:
+  All preflight checks returned green. The cluster was cleared by the
+  Assisted Installer to proceed with installation.
+
+--------------------------------------------------------------------------------
+PHASE 9 — CLUSTER INSTALLATION
+--------------------------------------------------------------------------------
+
+Installation was triggered via the Assisted Installer API. Progress was
+monitored from the bastion server.
+
+  Command used:
+  $ curl -s -X POST \
+      "$AI_URL/clusters/$CLUSTER_ID/actions/install" \
+      -H "Authorization: Bearer $(cat /root/ai-token)"
+
+  Output observed:
+  {
+    "status": "installing",
+    "status_info": "Installation in progress"
+  }
+
+  Installation progress was monitored:
+
+  Command used:
+  $ watch -n 30 'curl -s "$AI_URL/clusters/$CLUSTER_ID" \
+      -H "Authorization: Bearer $(cat /root/ai-token)" | \
+      python3 -c "
+  import json,sys
+  d=json.load(sys.stdin)
+  print(\"Status:\", d[\"status\"])
+  print(\"Progress:\", d.get(\"progress\",{}).get(\"installing_stage_percentage\",0),\"%\")
+  "'
+
+  Output observed (progression):
+  Status: installing     Progress: 13 %
+  Status: installing     Progress: 45 %
+  Status: installing     Progress: 78 %
+  Status: finalizing     Progress: 95 %
+  Status: installed      Progress: 100 %
+
+--------------------------------------------------------------------------------
+PHASE 10 — POST-INSTALL CLUSTER VALIDATION
+--------------------------------------------------------------------------------
+
+The kubeconfig was downloaded and cluster health was validated from the
+bastion server.
+
+  Command used:
+  $ curl -s \
+      "$AI_URL/clusters/$CLUSTER_ID/downloads/credentials?file_name=kubeconfig" \
+      -H "Authorization: Bearer $(cat /root/ai-token)" \
+      -o /root/.kube/config
+
+  $ chmod 600 /root/.kube/config
+
+  Command used:
+  $ oc whoami
+
+  Output observed:
+  system:admin
+
+  Command used:
+  $ oc get nodes -o wide
+
+  Output observed:
+  NAME                         STATUS   ROLES           AGE   VERSION
+  master-0.ocp.company.com     Ready    master,control  15m   v1.27.6+b49f9a1
+  master-1.ocp.company.com     Ready    master,control  15m   v1.27.6+b49f9a1
+  master-2.ocp.company.com     Ready    master,control  15m   v1.27.6+b49f9a1
+  worker-0.ocp.company.com     Ready    worker          10m   v1.27.6+b49f9a1
+  worker-1.ocp.company.com     Ready    worker          10m   v1.27.6+b49f9a1
+  worker-2.ocp.company.com     Ready    worker          10m   v1.27.6+b49f9a1
+  worker-3.ocp.company.com     Ready    worker          10m   v1.27.6+b49f9a1
+  worker-4.ocp.company.com     Ready    worker          10m   v1.27.6+b49f9a1
+  worker-5.ocp.company.com     Ready    worker          10m   v1.27.6+b49f9a1
+
+  All cluster operators were verified:
+
+  Command used:
+  $ oc get clusteroperators
+
+  Output observed:
+  NAME                   VERSION    AVAILABLE   PROGRESSING   DEGRADED
+  authentication         4.14.15    True        False         False
+  console                4.14.15    True        False         False
+  dns                    4.14.15    True        False         False
+  etcd                   4.14.15    True        False         False
+  image-registry         4.14.15    True        False         False
+  ingress                4.14.15    True        False         False
+  kube-apiserver         4.14.15    True        False         False
+  machine-config         4.14.15    True        False         False
+  monitoring             4.14.15    True        False         False
+  network                4.14.15    True        False         False
+  storage                4.14.15    True        False         False
+
+  HAProxy VIP routing was tested from bastion:
+
+  Command used:
+  $ curl -k https://api.ocp.company.com:6443/version
+
+  Output observed:
+  {
+    "major": "1",
+    "minor": "27",
+    "gitVersion": "v1.27.6+b49f9a1",
+    "platform": "linux/amd64"
+  }
+
+  Command used:
+  $ curl -I http://console-openshift-console.apps.ocp.company.com
+
+  Output observed:
+  HTTP/1.1 200 OK
+  Server: openshift
+
+  Observation:
+  Both the API VIP (192.168.10.100) and Ingress VIP (192.168.10.101)
+  were confirmed routing correctly through HAProxy to the cluster.
+
+--------------------------------------------------------------------------------
+PHASE 11 — IBM BLOCK CSI DRIVER INSTALLATION
+--------------------------------------------------------------------------------
+
+The IBM Block CSI operator was installed from OperatorHub and configured
+to enable dynamic PV provisioning from IBM SAN storage.
+
+  Operator subscription was created:
+
+  Configuration applied:
+  -----------------------------------------------------------------------
+  apiVersion: operators.coreos.com/v1alpha1
+  kind: Subscription
+  metadata:
+    name: ibm-block-csi-operator
+    namespace: openshift-operators
+  spec:
+    channel: stable
+    name: ibm-block-csi-operator
+    source: certified-operators
+    sourceNamespace: openshift-marketplace
+  -----------------------------------------------------------------------
+
+  The IBMBlockCSI instance was created:
+
+  -----------------------------------------------------------------------
+  apiVersion: csi.ibm.com/v1
+  kind: IBMBlockCSI
+  metadata:
+    name: ibm-block-csi
+    namespace: openshift-operators
+  spec:
+    controller:
+      repository: cp.icr.io/cp/spectrum/scale/csi/ibm-block-csi-driver-controller
+      tag: 1.11.0
+    node:
+      repository: cp.icr.io/cp/spectrum/scale/csi/ibm-block-csi-driver-node
+      tag: 1.11.0
+  -----------------------------------------------------------------------
+
+  A StorageClass was created for IBM SAN dynamic provisioning:
+
+  -----------------------------------------------------------------------
+  apiVersion: storage.k8s.io/v1
+  kind: StorageClass
+  metadata:
+    name: ibm-block-gold
+    annotations:
+      storageclass.kubernetes.io/is-default-class: "true"
+  provisioner: block.csi.ibm.com
+  parameters:
+    SpaceEfficiency: deduplicated
+    pool: ocp-pool
+    csi.storage.k8s.io/provisioner-secret-name: ibm-storage-secret
+    csi.storage.k8s.io/provisioner-secret-namespace: openshift-operators
+  reclaimPolicy: Retain
+  allowVolumeExpansion: true
+  volumeBindingMode: Immediate
+  -----------------------------------------------------------------------
+
+  CSI pod health was verified:
+
+  Command used:
+  $ oc get pods -n openshift-operators | grep ibm-block
+
+  Output observed:
+  ibm-block-csi-controller-0      6/6   Running   0   5m
+  ibm-block-csi-node-4bnzq        3/3   Running   0   5m
+  ibm-block-csi-node-7hxrt        3/3   Running   0   5m
+  ibm-block-csi-node-9kmpw        3/3   Running   0   5m
+
+  Dynamic provisioning was tested with a PVC:
+
+  Command used:
+  $ oc apply -f test-pvc.yaml
+  $ oc get pvc test-ibm-pvc
+
+  Output observed:
+  NAME            STATUS   VOLUME                                     CAPACITY   STORAGECLASS
+  test-ibm-pvc    Bound    pvc-a1b2c3d4-e5f6-7890-abcd-ef1234567890   10Gi       ibm-block-gold
+
+  Observation:
+  The PVC was bound immediately, confirming that the IBM Block CSI driver
+  was successfully communicating with the IBM SAN and dynamically
+  provisioning volumes from the ocp-pool storage pool.
+
+--------------------------------------------------------------------------------
+SUMMARY
+--------------------------------------------------------------------------------
+
+  Phase         Activity                          Key Tool / Command
+  ------------- --------------------------------- ----------------------------
+  Planning      Node role layout                  Manual planning
+  DNS           API + ingress + etcd records      dig for validation
+  HAProxy       4 port LB config                  haproxy.cfg
+  Keepalived    Floating VIP HA                   keepalived.conf
+  IBM SAN       Zone + LUN + multipath            lshost, mkvdisk, multipath
+  Assisted Inst Create cluster + generate ISO     curl API
+  Node boot     Mount ISO via iDRAC               racadm
+  Roles         Master/worker assignment          Assisted Installer API
+  Preflight     Validation checks                 Assisted Installer API
+  Install       Trigger and monitor               Assisted Installer API
+  Post-install  Node + operator validation        oc get nodes, oc get co
+  Storage CSI   IBM Block CSI + StorageClass      OperatorHub + StorageClass
+
+  Key lessons observed during this lab:
+  1. DNS must be 100% correct before ISO generation — incorrect SRV records
+     cause bootstrap etcd to fail silently.
+  2. HAProxy must be listening on port 22623 during bootstrap — this port
+     is only needed during install and can be restricted post-install.
+  3. IBM SAN multipath must be active on nodes before the CSI driver is
+     installed — the driver probes existing paths at startup.
+  4. Keepalived advert_int should match across both nodes — mismatched
+     values cause VIP flapping.
+
+================================================================================
+ END 
+================================================================================
