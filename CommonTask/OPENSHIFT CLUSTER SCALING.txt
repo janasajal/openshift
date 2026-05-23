@@ -1,0 +1,355 @@
+================================================================================
+ OPENSHIFT CLUSTER SCALING
+ OpenShift Administration Lab Notes
+ Author : Sajal Jana 
+ Version: 1.0
+================================================================================
+
+OBJECTIVE
+---------
+Additional worker nodes were added to the cluster in response to increased
+workload demand. Pre-scaling validations were performed, MachineSets were
+scaled declaratively, and the Cluster Autoscaler was configured to handle
+future demand automatically.
+
+--------------------------------------------------------------------------------
+STEP 1 — CURRENT NODE STATUS VERIFICATION
+--------------------------------------------------------------------------------
+
+The current state of all cluster nodes was checked to establish a baseline
+before any scaling action was taken.
+
+  Command used:
+  $ oc get nodes -o wide
+
+  Output observed:
+  NAME                          STATUS   ROLES    AGE   VERSION           INTERNAL-IP
+  master-0.ocp.company.com      Ready    master   45d   v1.27.6+b49f9a1   192.168.10.10
+  master-1.ocp.company.com      Ready    master   45d   v1.27.6+b49f9a1   192.168.10.11
+  master-2.ocp.company.com      Ready    master   45d   v1.27.6+b49f9a1   192.168.10.12
+  worker-0.ocp.company.com      Ready    worker   45d   v1.27.6+b49f9a1   192.168.10.20
+  worker-1.ocp.company.com      Ready    worker   45d   v1.27.6+b49f9a1   192.168.10.21
+  worker-2.ocp.company.com      Ready    worker   45d   v1.27.6+b49f9a1   192.168.10.22
+
+  Observation:
+  Three worker nodes were found in Ready state. No nodes were in NotReady
+  or SchedulingDisabled state.
+
+--------------------------------------------------------------------------------
+STEP 2 — NODE RESOURCE UTILIZATION CHECK
+--------------------------------------------------------------------------------
+
+Resource utilization across all nodes was reviewed to confirm that the scaling
+request was genuine and not caused by misconfigured resource limits or a
+runaway workload.
+
+  Command used:
+  $ oc adm top nodes
+
+  Output observed:
+  NAME                        CPU(cores)   CPU%   MEMORY(bytes)   MEMORY%
+  master-0.ocp.company.com    820m         21%    6421Mi          40%
+  master-1.ocp.company.com    910m         23%    6238Mi          39%
+  master-2.ocp.company.com    780m         20%    6105Mi          38%
+  worker-0.ocp.company.com    3750m        94%    28512Mi         89%
+  worker-1.ocp.company.com    3680m        92%    27998Mi         87%
+  worker-2.ocp.company.com    3820m        96%    29100Mi         91%
+
+  Observation:
+  All three worker nodes were found to be operating above 90% CPU and
+  87% memory utilization. This confirmed that the scaling request was
+  justified and not a result of misconfiguration.
+
+--------------------------------------------------------------------------------
+STEP 3 — PENDING PODS IDENTIFICATION
+--------------------------------------------------------------------------------
+
+Pods in Pending state were listed across all namespaces to identify workloads
+that could not be scheduled due to insufficient cluster resources.
+
+  Command used:
+  $ oc get pods --all-namespaces --field-selector=status.phase=Pending
+
+  Output observed:
+  NAMESPACE    NAME                          READY   STATUS    RESTARTS   AGE
+  production   api-deployment-7d9f8b-xkp2f   0/1     Pending   0          18m
+  production   api-deployment-7d9f8b-mn4lp   0/1     Pending   0          18m
+  production   worker-job-6c8d7b-tn9kq       0/1     Pending   0          25m
+
+  A pending pod was described to confirm the scheduler rejection reason:
+
+  Command used:
+  $ oc describe pod api-deployment-7d9f8b-xkp2f -n production | tail -15
+
+  Output observed:
+  Events:
+    Type     Reason             Age   From                Message
+    ----     ------             ----  ----                -------
+    Warning  FailedScheduling   18m   default-scheduler   0/3 nodes are available:
+                                                          3 Insufficient cpu,
+                                                          3 Insufficient memory.
+                                                          preemption: 0/3 nodes
+                                                          are available.
+
+  Observation:
+  The scheduler explicitly reported that no nodes had sufficient CPU or
+  memory to place the pods. Scaling was confirmed as the correct remediation.
+
+--------------------------------------------------------------------------------
+STEP 4 — CLUSTER RESOURCE ALLOCATION REVIEW
+--------------------------------------------------------------------------------
+
+Overall resource allocation across worker nodes was reviewed to understand
+the current request and limit consumption levels.
+
+  Command used:
+  $ oc describe nodes | grep -A 6 "Allocated resources"
+
+  Output observed:
+  Allocated resources:
+    Resource    Requests      Limits
+    --------    --------      ------
+    cpu         3700m (92%)   4000m (100%)
+    memory      27Gi  (84%)   30Gi  (93%)
+
+  Observation:
+  CPU requests were at 92% and limits at 100%, confirming no headroom
+  remained for new pod scheduling.
+
+--------------------------------------------------------------------------------
+STEP 5 — MACHINESET VALIDATION
+--------------------------------------------------------------------------------
+
+The existing MachineSets were reviewed before scaling to confirm their
+configuration, instance types, and current replica counts.
+
+  Command used:
+  $ oc get machinesets -n openshift-machine-api
+
+  Output observed:
+  NAME                               DESIRED   CURRENT   READY   AVAILABLE   AGE
+  ocp-cluster-worker-us-east-1a     1         1         1       1           45d
+  ocp-cluster-worker-us-east-1b     1         1         1       1           45d
+  ocp-cluster-worker-us-east-1c     1         1         1       1           45d
+
+  A MachineSet was described to verify the instance type before scaling:
+
+  Command used:
+  $ oc describe machineset ocp-cluster-worker-us-east-1a \
+      -n openshift-machine-api | grep -E "Instance Type|Replicas|Region|Zone"
+
+  Output observed:
+    Instance Type:  m5.4xlarge
+    Replicas:       1
+    Region:         us-east-1
+    Zone:           us-east-1a
+
+  Observation:
+  The m5.4xlarge instance type was confirmed appropriate for the production
+  workload profile. Replicas were set to 1 per zone, giving a total of
+  3 worker nodes across 3 availability zones.
+
+--------------------------------------------------------------------------------
+STEP 6 — MACHINESET SCALING
+--------------------------------------------------------------------------------
+
+Each MachineSet replica count was increased from 1 to 2, adding one new
+worker node per availability zone. This approach ensured that new nodes
+were distributed evenly across zones for high availability.
+
+  Commands used:
+  $ oc scale machineset ocp-cluster-worker-us-east-1a \
+      -n openshift-machine-api --replicas=2
+
+  $ oc scale machineset ocp-cluster-worker-us-east-1b \
+      -n openshift-machine-api --replicas=2
+
+  $ oc scale machineset ocp-cluster-worker-us-east-1c \
+      -n openshift-machine-api --replicas=2
+
+  Output observed:
+  machineset.machine.openshift.io/ocp-cluster-worker-us-east-1a scaled
+  machineset.machine.openshift.io/ocp-cluster-worker-us-east-1b scaled
+  machineset.machine.openshift.io/ocp-cluster-worker-us-east-1c scaled
+
+--------------------------------------------------------------------------------
+STEP 7 — MACHINE PROVISIONING MONITORING
+--------------------------------------------------------------------------------
+
+The provisioning lifecycle of new machines was observed in real time to
+track their progress from Provisioning to Running state.
+
+  Command used:
+  $ oc get machines -n openshift-machine-api -w
+
+  Output observed:
+  NAME                                    PHASE          TYPE         REGION
+  ocp-cluster-worker-us-east-1a-xkp2f    Running        m5.4xlarge   us-east-1
+  ocp-cluster-worker-us-east-1a-mn7tq    Provisioning   m5.4xlarge   us-east-1
+  ocp-cluster-worker-us-east-1b-tn9kq    Running        m5.4xlarge   us-east-1
+  ocp-cluster-worker-us-east-1b-br4lp    Provisioning   m5.4xlarge   us-east-1
+  ocp-cluster-worker-us-east-1c-qr2mn    Running        m5.4xlarge   us-east-1
+  ocp-cluster-worker-us-east-1c-vk8wz    Provisioned    m5.4xlarge   us-east-1
+
+  Observation:
+  New machines progressed through Provisioning → Provisioned → Running
+  automatically. No manual intervention was required. Once in Running
+  state, nodes joined the cluster without additional steps.
+
+--------------------------------------------------------------------------------
+STEP 8 — POST-SCALING NODE VERIFICATION
+--------------------------------------------------------------------------------
+
+The node list was re-checked after scaling to confirm that new nodes had
+joined the cluster and were in Ready state.
+
+  Command used:
+  $ oc get nodes -o wide
+
+  Output observed:
+  NAME                          STATUS   ROLES    AGE   VERSION
+  worker-0.ocp.company.com      Ready    worker   45d   v1.27.6+b49f9a1
+  worker-1.ocp.company.com      Ready    worker   45d   v1.27.6+b49f9a1
+  worker-2.ocp.company.com      Ready    worker   45d   v1.27.6+b49f9a1
+  worker-3.ocp.company.com      Ready    worker   4m    v1.27.6+b49f9a1
+  worker-4.ocp.company.com      Ready    worker   3m    v1.27.6+b49f9a1
+  worker-5.ocp.company.com      Ready    worker   3m    v1.27.6+b49f9a1
+
+  Observation:
+  Three new worker nodes (worker-3, worker-4, worker-5) were confirmed
+  in Ready state. The cluster now has six worker nodes total.
+
+--------------------------------------------------------------------------------
+STEP 9 — PENDING PODS RE-VALIDATION
+--------------------------------------------------------------------------------
+
+The pending pod list was rechecked to confirm that all previously unschedulable
+pods had been placed on the new nodes.
+
+  Command used:
+  $ oc get pods --all-namespaces --field-selector=status.phase=Pending
+
+  Output observed:
+  No resources found.
+
+  Node utilization was also rechecked to confirm healthy distribution:
+
+  Command used:
+  $ oc adm top nodes
+
+  Output observed:
+  NAME                        CPU(cores)   CPU%   MEMORY(bytes)   MEMORY%
+  worker-0.ocp.company.com    3750m        94%    28512Mi         89%
+  worker-1.ocp.company.com    3680m        92%    27998Mi         87%
+  worker-2.ocp.company.com    3820m        96%    29100Mi         91%
+  worker-3.ocp.company.com    420m         11%    4200Mi          13%
+  worker-4.ocp.company.com    380m         10%    3900Mi          12%
+  worker-5.ocp.company.com    310m         8%     3600Mi          11%
+
+  Observation:
+  All pending pods were scheduled. New nodes were lightly loaded, confirming
+  that workloads would rebalance naturally as new deployments are created.
+
+--------------------------------------------------------------------------------
+STEP 10 — CLUSTER OPERATOR HEALTH CHECK
+--------------------------------------------------------------------------------
+
+All cluster operators were verified to be in healthy state after the
+scaling operation.
+
+  Command used:
+  $ oc get clusteroperators
+
+  Output observed:
+  NAME                        VERSION   AVAILABLE   PROGRESSING   DEGRADED
+  authentication              4.13.6    True        False         False
+  cluster-autoscaler          4.13.6    True        False         False
+  dns                         4.13.6    True        False         False
+  etcd                        4.13.6    True        False         False
+  ingress                     4.13.6    True        False         False
+  kube-apiserver              4.13.6    True        False         False
+  machine-api                 4.13.6    True        False         False
+  monitoring                  4.13.6    True        False         False
+  network                     4.13.6    True        False         False
+  storage                     4.13.6    True        False         False
+
+  Observation:
+  All operators showed Available=True, Progressing=False, Degraded=False.
+  The cluster was confirmed fully healthy post-scaling.
+
+--------------------------------------------------------------------------------
+STEP 11 — CLUSTER AUTOSCALER CONFIGURATION
+--------------------------------------------------------------------------------
+
+To avoid manual scaling in future demand spikes, the ClusterAutoscaler and
+MachineAutoscaler were configured for each zone's MachineSet.
+
+  The ClusterAutoscaler was created with a maximum node cap of 24:
+
+  Configuration applied:
+  -----------------------------------------------------------------------
+  apiVersion: autoscaling.openshift.io/v1
+  kind: ClusterAutoscaler
+  metadata:
+    name: default
+  spec:
+    resourceLimits:
+      maxNodesTotal: 24
+    scaleDown:
+      enabled: true
+      delayAfterAdd: 10m
+      delayAfterDelete: 5m
+      delayAfterFailure: 30s
+      unneededTime: 10m
+  -----------------------------------------------------------------------
+
+  A MachineAutoscaler was created for each zone:
+
+  -----------------------------------------------------------------------
+  apiVersion: autoscaling.openshift.io/v1beta1
+  kind: MachineAutoscaler
+  metadata:
+    name: worker-us-east-1a-autoscaler
+    namespace: openshift-machine-api
+  spec:
+    minReplicas: 1
+    maxReplicas: 5
+    scaleTargetRef:
+      apiVersion: machine.openshift.io/v1beta1
+      kind: MachineSet
+      name: ocp-cluster-worker-us-east-1a
+  -----------------------------------------------------------------------
+
+  The autoscaler resources were verified:
+
+  Command used:
+  $ oc get clusterautoscaler
+  $ oc get machineautoscaler -n openshift-machine-api
+
+  Output observed:
+  NAME      AGE
+  default   1m
+
+  NAME                              REF KIND     MIN   MAX   AGE
+  worker-us-east-1a-autoscaler      MachineSet   1     5     1m
+
+--------------------------------------------------------------------------------
+SUMMARY
+--------------------------------------------------------------------------------
+
+  Phase            Action                         Command
+  ---------------- ------------------------------ ----------------------------
+  Pre-validation   Node resource check            oc adm top nodes
+  Pre-validation   Pending pod identification     oc get pods --field-selector
+  Pre-validation   Scheduler rejection reason     oc describe pod
+  Pre-validation   MachineSet instance review     oc describe machineset
+  Scaling          Increase MachineSet replicas   oc scale machineset
+  Scaling          Watch machine provisioning     oc get machines -w
+  Post-validation  Node readiness check           oc get nodes
+  Post-validation  Pending pod clearance          oc get pods
+  Post-validation  Cluster operator health        oc get clusteroperators
+  Automation       ClusterAutoscaler setup        ClusterAutoscaler CRD
+
+================================================================================
+ END 
+================================================================================
