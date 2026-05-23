@@ -319,5 +319,3 @@ Congrats! You now know the secret sauce of running VMs in Kubernetes:
 
 ---
 
-**Author:** Sajal Jana  
-**Disclaimer:** No VMs were harmed in the making of this guide 🖥️
