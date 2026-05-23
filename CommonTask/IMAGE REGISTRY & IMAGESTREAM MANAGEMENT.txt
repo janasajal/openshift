@@ -1,0 +1,441 @@
+================================================================================
+ IMAGE REGISTRY & IMAGESTREAM MANAGEMENT
+ OpenShift Administration Lab Notes
+ Author : Sajal Jana 
+ Version: 1.0
+================================================================================
+
+OBJECTIVE
+---------
+The OpenShift internal image registry was configured with persistent storage
+and external route access. ImageStreams were created and linked to application
+deployments to enable automated image-triggered rollouts. RBAC was applied
+to restrict registry access per team, and a pull secret was configured for
+an external private registry.
+
+--------------------------------------------------------------------------------
+STEP 1 — INTERNAL REGISTRY STATUS VERIFICATION
+--------------------------------------------------------------------------------
+
+The image registry operator configuration and pod health were verified before
+making any changes.
+
+  Command used:
+  $ oc get configs.imageregistry.operator.openshift.io cluster
+
+  Output observed:
+  NAME      MANAGEMENTSTATE   STORAGE   READONLY   HOSTNAME
+  cluster   Managed           s3                   image-registry.openshift-image-registry.svc:5000
+
+  Command used:
+  $ oc get pods -n openshift-image-registry
+
+  Output observed:
+  NAME                                               READY   STATUS    RESTARTS   AGE
+  cluster-image-registry-operator-7d9f8b6c5-xkp2f   1/1     Running   0          45d
+  image-registry-6b8f9c7d4-mn4lp                    1/1     Running   0          45d
+  image-registry-6b8f9c7d4-tn9kq                    1/1     Running   0          45d
+  node-ca-4bnzq                                      1/1     Running   0          45d
+  node-ca-7hxrt                                      1/1     Running   0          45d
+  node-ca-9kmpw                                      1/1     Running   0          45d
+
+  Observation:
+  Two registry pods were confirmed running, providing high availability.
+  node-ca pods were found on each node, responsible for distributing the
+  registry CA certificate so all nodes trust the internal registry TLS.
+
+--------------------------------------------------------------------------------
+STEP 2 — PERSISTENT STORAGE CONFIGURATION FOR REGISTRY
+--------------------------------------------------------------------------------
+
+The registry was configured with persistent storage to ensure images survive
+pod restarts. For on-premises environments, a PVC backed by CephFS was used.
+
+  A PVC was created for registry storage:
+
+  Configuration applied:
+  -----------------------------------------------------------------------
+  apiVersion: v1
+  kind: PersistentVolumeClaim
+  metadata:
+    name: image-registry-storage
+    namespace: openshift-image-registry
+  spec:
+    accessModes:
+      - ReadWriteMany
+    resources:
+      requests:
+        storage: 200Gi
+    storageClassName: ocs-storagecluster-cephfs
+  -----------------------------------------------------------------------
+
+  Command used:
+  $ oc apply -f registry-pvc.yaml
+
+  The registry operator configuration was then updated to reference the PVC:
+
+  -----------------------------------------------------------------------
+  apiVersion: imageregistry.operator.openshift.io/v1
+  kind: Config
+  metadata:
+    name: cluster
+  spec:
+    managementState: Managed
+    replicas: 2
+    storage:
+      pvc:
+        claim: image-registry-storage
+    defaultRoute: true
+    rolloutStrategy: RollingUpdate
+  -----------------------------------------------------------------------
+
+  Observation:
+  ReadWriteMany access mode was specified because multiple registry pod
+  replicas need to read and write to the same storage simultaneously.
+  For cloud environments (AWS), an S3 bucket would be used instead.
+
+--------------------------------------------------------------------------------
+STEP 3 — REGISTRY EXTERNAL ROUTE EXPOSURE
+--------------------------------------------------------------------------------
+
+An external route was enabled so that Docker/Podman clients and CI/CD
+pipelines outside the cluster could push and pull images.
+
+  Command used:
+  $ oc patch configs.imageregistry.operator.openshift.io cluster \
+      --type merge \
+      --patch '{"spec":{"defaultRoute":true}}'
+
+  The route hostname was retrieved:
+
+  Command used:
+  $ oc get route default-route -n openshift-image-registry
+
+  Output observed:
+  NAME            HOST/PORT
+  default-route   default-route-openshift-image-registry.apps.ocp.company.com
+
+  A Docker login was performed to verify registry access:
+
+  Command used:
+  $ REGISTRY=$(oc get route default-route \
+      -n openshift-image-registry \
+      --template='{{ .spec.host }}')
+
+  $ docker login -u $(oc whoami) \
+                 -p $(oc whoami --show-token) \
+                 $REGISTRY
+
+  Output observed:
+  WARNING! Using --password via the CLI is insecure.
+  Login Succeeded
+
+  Observation:
+  The OpenShift OAuth token was used as the Docker password. This means
+  registry authentication is integrated with the OpenShift RBAC system.
+
+--------------------------------------------------------------------------------
+STEP 4 — RBAC FOR REGISTRY ACCESS CONTROL
+--------------------------------------------------------------------------------
+
+Role bindings were applied to grant appropriate registry access to different
+teams. Developers were given push access and the QA team was given pull-only
+access. The staging namespace service account was permitted to pull images.
+
+  Push access was granted to the development user:
+
+  Command used:
+  $ oc policy add-role-to-user registry-editor \
+      dev-user -n my-app-namespace
+
+  Push access was granted to the Jenkins CI/CD service account:
+
+  Command used:
+  $ oc policy add-role-to-user registry-editor \
+      system:serviceaccount:cicd-namespace:jenkins \
+      -n my-app-namespace
+
+  Pull-only access was granted to the QA user:
+
+  Command used:
+  $ oc policy add-role-to-user registry-viewer \
+      qa-user -n my-app-namespace
+
+  Image pull permission was granted to the staging namespace service account:
+
+  Command used:
+  $ oc policy add-role-to-user system:image-puller \
+      system:serviceaccount:staging:default \
+      -n my-app-namespace
+
+  Role bindings were verified:
+
+  Command used:
+  $ oc get rolebindings -n my-app-namespace | grep registry
+
+  Output observed:
+  registry-editor-dev-user        registry-editor      45s
+  registry-editor-jenkins         registry-editor      30s
+  registry-viewer-qa-user         registry-viewer      20s
+  image-puller-staging            system:image-puller  15s
+
+--------------------------------------------------------------------------------
+STEP 5 — IMAGESTREAM CREATION
+--------------------------------------------------------------------------------
+
+An ImageStream was created to act as an abstraction layer over the actual
+container image stored in the registry. Application deployments reference
+the ImageStream tag rather than a direct image URL.
+
+  Configuration applied:
+  -----------------------------------------------------------------------
+  apiVersion: image.openshift.io/v1
+  kind: ImageStream
+  metadata:
+    name: my-app
+    namespace: my-app-namespace
+    labels:
+      app: my-app
+  spec:
+    lookupPolicy:
+      local: true
+  -----------------------------------------------------------------------
+
+  Command used:
+  $ oc apply -f imagestream.yaml
+
+  The ImageStream was verified:
+
+  Command used:
+  $ oc get imagestream -n my-app-namespace
+
+  Output observed:
+  NAME      IMAGE REPOSITORY
+  my-app    image-registry.openshift-image-registry.svc:5000/my-app-namespace/my-app
+
+  Observation:
+  The lookupPolicy.local field was set to true so that pods in the same
+  namespace can reference the ImageStream by short name without needing
+  the full registry URL.
+
+--------------------------------------------------------------------------------
+STEP 6 — EXTERNAL IMAGE IMPORT INTO IMAGESTREAM
+--------------------------------------------------------------------------------
+
+An external image from the corporate registry was imported into the
+OpenShift ImageStream. The --scheduled flag was used to enable periodic
+re-import, so the ImageStream stays synchronized with upstream updates.
+
+  Command used:
+  $ oc import-image my-app:latest \
+      --from=registry.company.com/myteam/my-app:latest \
+      --confirm \
+      --scheduled \
+      -n my-app-namespace
+
+  Output observed:
+  imagestream.image.openshift.io/my-app imported
+
+  Name:             my-app
+  Namespace:        my-app-namespace
+  Image Repository: image-registry.openshift-image-registry.svc:5000/my-app-namespace/my-app
+  Tags:             1
+
+  latest
+    tagged from registry.company.com/myteam/my-app:latest
+
+    * registry.company.com/myteam/my-app@sha256:4a7b9c8d...
+        Less than a second ago
+
+  Observation:
+  The --scheduled flag causes OpenShift to periodically poll the upstream
+  registry and re-import if the image digest changes, enabling automatic
+  detection of new upstream releases.
+
+--------------------------------------------------------------------------------
+STEP 7 — ENVIRONMENT PROMOTION USING IMAGESTREAM TAGS
+--------------------------------------------------------------------------------
+
+A tagging strategy was applied to promote images across dev, staging, and
+production environments without modifying any deployment configuration. Tags
+were created by pointing to existing ImageStream entries.
+
+  Dev image was tagged as staging-ready:
+
+  Command used:
+  $ oc tag my-app-namespace/my-app:latest \
+            my-app-namespace/my-app:staging
+
+  Staging image was tagged as production-ready after QA sign-off:
+
+  Command used:
+  $ oc tag my-app-namespace/my-app:staging \
+            my-app-namespace/my-app:production
+
+  All tags were verified:
+
+  Command used:
+  $ oc describe imagestream my-app -n my-app-namespace
+
+  Output observed:
+  Name:             my-app
+  Namespace:        my-app-namespace
+  Tags:
+
+    latest
+      * sha256:4a7b9c8d...  10 minutes ago
+
+    staging
+      * sha256:4a7b9c8d...  5 minutes ago
+
+    production
+      * sha256:4a7b9c8d...  2 minutes ago
+
+  Observation:
+  Each environment references a tag on the same ImageStream. Promoting an
+  image to production only requires retagging — no deployment YAML changes
+  are needed.
+
+--------------------------------------------------------------------------------
+STEP 8 — IMAGESTREAM TRIGGER LINKED TO DEPLOYMENT
+--------------------------------------------------------------------------------
+
+An image trigger annotation was added to the application Deployment so that
+whenever the ImageStream tag is updated, an automatic rollout is initiated.
+
+  Configuration applied:
+  -----------------------------------------------------------------------
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: my-app
+    namespace: my-app-namespace
+    annotations:
+      image.openshift.io/triggers: >-
+        [{"from":{"kind":"ImageStreamTag","name":"my-app:latest",
+        "namespace":"my-app-namespace"},
+        "fieldPath":"spec.template.spec.containers[?(@.name==\"my-app\")].image"}]
+  spec:
+    replicas: 2
+    selector:
+      matchLabels:
+        app: my-app
+    template:
+      metadata:
+        labels:
+          app: my-app
+      spec:
+        containers:
+          - name: my-app
+            image: >-
+              image-registry.openshift-image-registry.svc:5000/
+              my-app-namespace/my-app:latest
+            ports:
+              - containerPort: 8080
+  -----------------------------------------------------------------------
+
+  The trigger was verified:
+
+  Command used:
+  $ oc set triggers deployment/my-app -n my-app-namespace
+
+  Output observed:
+  NAME     TYPE    VALUE                                AUTO
+  my-app   image   my-app-namespace/my-app:latest       true
+
+  Observation:
+  The AUTO column shows true, confirming that any update to the
+  my-app:latest ImageStream tag will automatically trigger a rollout.
+
+--------------------------------------------------------------------------------
+STEP 9 — IMAGE PUSH AND AUTO-ROLLOUT VERIFICATION
+--------------------------------------------------------------------------------
+
+A new image version was pushed to the internal registry to confirm that the
+ImageStream trigger initiated an automatic deployment rollout.
+
+  Commands used:
+  $ docker tag my-app:v2 \
+      default-route-openshift-image-registry.apps.ocp.company.com/my-app-namespace/my-app:latest
+
+  $ docker push \
+      default-route-openshift-image-registry.apps.ocp.company.com/my-app-namespace/my-app:latest
+
+  Output observed:
+  The push refers to repository [.../my-app-namespace/my-app]
+  latest: digest: sha256:9f3c2d1e... size: 1574
+
+  The deployment rollout was monitored:
+
+  Command used:
+  $ oc rollout status deployment/my-app -n my-app-namespace
+
+  Output observed:
+  Waiting for deployment "my-app" rollout to finish:
+    1 out of 2 new replicas updated...
+  Waiting for deployment "my-app" rollout to finish:
+    1 old replicas are pending termination...
+  deployment "my-app" successfully rolled out
+
+  Observation:
+  The image push to the internal registry automatically updated the
+  ImageStream, which triggered a rolling deployment update without
+  any manual oc rollout command being issued.
+
+--------------------------------------------------------------------------------
+STEP 10 — EXTERNAL PRIVATE REGISTRY PULL SECRET CONFIGURATION
+--------------------------------------------------------------------------------
+
+A pull secret was created for the corporate Artifactory registry and linked
+to the default and builder service accounts so pods and builds could pull
+images without manual credential management.
+
+  Command used:
+  $ oc create secret docker-registry external-registry-secret \
+      --docker-server=registry.company.com \
+      --docker-username=sa-openshift \
+      --docker-password=SuperSecretPass \
+      --docker-email=openshift@company.com \
+      -n my-app-namespace
+
+  The secret was linked to the default SA for pod image pulls:
+
+  Command used:
+  $ oc secrets link default external-registry-secret \
+      --for=pull \
+      -n my-app-namespace
+
+  The secret was linked to the builder SA for S2I builds:
+
+  Command used:
+  $ oc secrets link builder external-registry-secret \
+      -n my-app-namespace
+
+  The service account pull secrets were verified:
+
+  Command used:
+  $ oc describe serviceaccount default -n my-app-namespace | grep -A5 "Image pull"
+
+  Output observed:
+  Image pull secrets:
+    default-dockercfg-xkp2f
+    external-registry-secret
+
+--------------------------------------------------------------------------------
+SUMMARY
+--------------------------------------------------------------------------------
+
+  Area             Action                          Key Command
+  ---------------- ------------------------------- ----------------------------
+  Registry health  Validate pods and operator      oc get pods -n openshift-image-registry
+  Storage          Attach persistent PVC           Edit configs.imageregistry...
+  External access  Expose registry route           oc patch configs...defaultRoute:true
+  RBAC             Push/pull role assignment       oc policy add-role-to-user
+  ImageStream      Create and import images        oc import-image --scheduled
+  Promotion        Tag across environments         oc tag dev:latest staging:latest
+  Auto-rollout     Trigger on image push           image.openshift.io/triggers annotation
+  External pull    Private registry secret         oc create secret docker-registry
+
+================================================================================
+ END 
+================================================================================
