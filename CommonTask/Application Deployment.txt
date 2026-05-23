@@ -1,0 +1,361 @@
+================================================================================
+  OpenShift Administration Lab
+  Application Deployment Request
+  Topic        : Deployment, Service, and Route Configuration
+  Author       : Sajal Jana 
+================================================================================
+
+
+OVERVIEW
+--------
+A containerized application deployment was requested by the application team.
+The workload was deployed into the dev-team-app namespace using a Kubernetes-
+native Deployment object. A ClusterIP Service was configured for internal
+communication and an edge-terminated Route was created for external HTTPS
+access. Health probes, resource limits, and rollback readiness were also
+verified as part of the deployment process.
+
+Note : Deployment (apps/v1) was used instead of DeploymentConfig, as
+DeploymentConfig is deprecated in OpenShift 4.x and Deployment is the
+recommended Kubernetes-native approach.
+
+
+--------------------------------------------------------------------------------
+STEP 1 : PRE-DEPLOYMENT CHECKS
+--------------------------------------------------------------------------------
+
+The target namespace was confirmed and the container image was verified for
+accessibility before the deployment was initiated.
+
+  Commands :
+  ----------
+  $ oc project dev-team-app
+
+  Output :
+  --------
+  Already on project "dev-team-app" on server "https://api.ocp.example.com:6443".
+
+  $ skopeo inspect docker://registry.example.com/myapp:v1.0
+
+  Output :
+  --------
+  {
+    "Name": "registry.example.com/myapp",
+    "Tag": "v1.0",
+    "Digest": "sha256:abc123def456...",
+    "RepoTags": [ "v1.0", "latest" ],
+    "Architecture": "amd64",
+    "Os": "linux"
+  }
+
+The image was confirmed as accessible and the architecture was verified as
+amd64, compatible with the cluster worker nodes.
+
+
+--------------------------------------------------------------------------------
+STEP 2 : DEPLOYMENT CREATION
+--------------------------------------------------------------------------------
+
+A Deployment manifest was prepared with 2 replicas, a RollingUpdate strategy,
+resource requests and limits, readiness and liveness probes, and environment
+variables sourced from a Secret.
+
+  File : deployment.yaml
+  -----------------------
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: myapp
+    namespace: dev-team-app
+    labels:
+      app: myapp
+      version: v1.0
+  spec:
+    replicas: 2
+    selector:
+      matchLabels:
+        app: myapp
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxSurge: 1
+        maxUnavailable: 0
+    template:
+      metadata:
+        labels:
+          app: myapp
+      spec:
+        containers:
+        - name: myapp
+          image: registry.example.com/myapp:v1.0
+          ports:
+          - containerPort: 8080
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          env:
+          - name: APP_ENV
+            value: "production"
+          - name: DB_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: myapp-db-secret
+                key: password
+
+  Command :
+  ---------
+  $ oc apply -f deployment.yaml
+
+  Output :
+  --------
+  deployment.apps/myapp created
+
+Notes on probe configuration :
+  - readinessProbe : controls when the pod is added to the Service endpoints.
+    Without this, traffic is sent to pods before the application is ready,
+    which results in 502 errors.
+  - livenessProbe  : restarts the container if the application becomes
+    unresponsive after startup.
+
+
+--------------------------------------------------------------------------------
+STEP 3 : SERVICE CREATION
+--------------------------------------------------------------------------------
+
+A ClusterIP Service was created to provide stable internal DNS-based access
+to the application pods. The selector was matched to the app label defined
+in the Deployment template.
+
+  File : service.yaml
+  --------------------
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: myapp-svc
+    namespace: dev-team-app
+    labels:
+      app: myapp
+  spec:
+    selector:
+      app: myapp
+    ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8080
+    type: ClusterIP
+
+  Command :
+  ---------
+  $ oc apply -f service.yaml
+
+  Output :
+  --------
+  service/myapp-svc created
+
+The Service listens on port 80 and forwards traffic to container port 8080
+on all pods matching the label app=myapp.
+
+
+--------------------------------------------------------------------------------
+STEP 4 : ROUTE CREATION
+--------------------------------------------------------------------------------
+
+An OpenShift Route was created to expose the application externally. Edge TLS
+termination was configured so that HTTPS is handled at the router level. HTTP
+traffic is automatically redirected to HTTPS.
+
+  File : route.yaml
+  ------------------
+  apiVersion: route.openshift.io/v1
+  kind: Route
+  metadata:
+    name: myapp-route
+    namespace: dev-team-app
+  spec:
+    host: myapp.apps.ocp.example.com
+    to:
+      kind: Service
+      name: myapp-svc
+      weight: 100
+    port:
+      targetPort: http
+    tls:
+      termination: edge
+      insecureEdgeTerminationPolicy: Redirect
+    wildcardPolicy: None
+
+  Command :
+  ---------
+  $ oc apply -f route.yaml
+
+  Output :
+  --------
+  route.route.openshift.io/myapp-route created
+
+TLS termination type used : edge
+  - SSL is terminated at the OpenShift Router (HAProxy)
+  - Traffic between the router and the pod is unencrypted (internal only)
+  - This is the standard approach for most production HTTP workloads
+
+
+--------------------------------------------------------------------------------
+STEP 5 : VALIDATION
+--------------------------------------------------------------------------------
+
+5.1  Rollout Status Verified
+  ---------------------------
+  $ oc rollout status deployment/myapp -n dev-team-app
+
+  Output :
+  --------
+  Waiting for deployment "myapp" rollout to finish: 1 of 2 updated replicas are available...
+  deployment "myapp" successfully rolled out
+
+
+5.2  Pod Status Verified
+  ------------------------
+  $ oc get pods -n dev-team-app -l app=myapp
+
+  Output :
+  --------
+  NAME                     READY   STATUS    RESTARTS   AGE
+  myapp-7d9f8b6c4-k2xpv    1/1     Running   0          2m
+  myapp-7d9f8b6c4-tz8qn    1/1     Running   0          2m
+
+  Both pods are in Running state with READY 1/1, confirming the readiness
+  probe passed successfully for each pod.
+
+
+5.3  Pod Details Verified
+  -------------------------
+  $ oc describe pod myapp-7d9f8b6c4-k2xpv -n dev-team-app
+
+  Output :
+  --------
+  Name:         myapp-7d9f8b6c4-k2xpv
+  Namespace:    dev-team-app
+  Node:         worker-1.ocp.example.com
+  Start Time:   Tue, 19 May 2026 10:00:00 +0530
+  Labels:       app=myapp
+  Status:       Running
+  IP:           10.128.2.45
+  Limits:
+    cpu:     500m
+    memory:  512Mi
+  Requests:
+    cpu:     200m
+    memory:  256Mi
+  Conditions:
+    Ready: True
+
+
+5.4  Service Endpoints Verified
+  --------------------------------
+  $ oc get endpoints myapp-svc -n dev-team-app
+
+  Output :
+  --------
+  NAME        ENDPOINTS                           AGE
+  myapp-svc   10.128.2.45:8080,10.128.2.46:8080   2m
+
+  Both pod IPs were registered as endpoints, confirming the Service selector
+  is correctly matching the pod labels.
+
+
+5.5  Route Admission Verified
+  -----------------------------
+  $ oc get route myapp-route -n dev-team-app
+
+  Output :
+  --------
+  NAME          HOST/PORT                        PATH   SERVICES    PORT   TERMINATION     WILDCARD
+  myapp-route   myapp.apps.ocp.example.com              myapp-svc   http   edge/Redirect   None
+
+  The route was admitted by the OpenShift router with TLS edge termination
+  and HTTP-to-HTTPS redirect confirmed.
+
+
+5.6  End-to-End Connectivity Verified
+  --------------------------------------
+  $ curl -I https://myapp.apps.ocp.example.com/health
+
+  Output :
+  --------
+  HTTP/2 200
+  content-type: application/json
+  x-powered-by: Express
+  date: Tue, 19 May 2026 04:30:00 GMT
+
+  HTTP 200 response was received, confirming the application is reachable
+  through the Route and is responding on the health endpoint.
+
+
+5.7  Application Logs Verified
+  --------------------------------
+  $ oc logs -l app=myapp -n dev-team-app --tail=20
+
+  Output :
+  --------
+  [2026-05-19 04:28:10] INFO  Server started on port 8080
+  [2026-05-19 04:28:10] INFO  Connected to database successfully
+  [2026-05-19 04:28:15] INFO  Health check endpoint ready at /health
+
+  No errors or warnings were observed in the application logs at startup.
+
+
+--------------------------------------------------------------------------------
+STEP 6 : ROLLBACK READINESS VERIFICATION
+--------------------------------------------------------------------------------
+
+The rollout history was reviewed to confirm a rollback revision is available
+in case a defect is discovered post-deployment.
+
+  $ oc rollout history deployment/myapp -n dev-team-app
+
+  Output :
+  --------
+  REVISION  CHANGE-CAUSE
+  1         Initial deployment v1.0
+
+  Rollback command available if required :
+  $ oc rollout undo deployment/myapp -n dev-team-app
+
+
+--------------------------------------------------------------------------------
+SUMMARY
+--------------------------------------------------------------------------------
+
+  The following configurations were completed for the myapp deployment :
+
+  [OK]  Image accessibility confirmed via skopeo inspect
+  [OK]  Deployment created     - 2 replicas, RollingUpdate, probes configured
+  [OK]  Service created        - ClusterIP, selector matched, endpoints populated
+  [OK]  Route created          - edge TLS, HTTP redirect enforced
+  [OK]  Rollout status         - successfully rolled out
+  [OK]  End-to-end test        - HTTP 200 received via curl
+  [OK]  Logs reviewed          - no errors at startup
+  [OK]  Rollback revision      - confirmed available
+
+  All manifest files were stored in the GitOps repository under :
+  /gitops/projects/dev-team-app/deployments/myapp/
+
+================================================================================
+  END 
+================================================================================
