@@ -1,0 +1,498 @@
+================================================================================
+ OPENSHIFT CLUSTER UPGRADE PLANNING & EXECUTION
+ OpenShift Administration Lab Notes
+ Author : Sajal Jana 
+ Version: 1.0
+================================================================================
+
+OBJECTIVE
+---------
+A planned OpenShift cluster upgrade was executed from version 4.13.6 to
+4.13.11 with minimal workload disruption. Pre-upgrade validations were
+performed, an etcd backup was taken, the upgrade was initiated through the
+Cluster Version Operator, and post-upgrade health was confirmed. A rollback
+procedure was also documented as part of the change plan.
+
+--------------------------------------------------------------------------------
+STEP 1 — CURRENT CLUSTER VERSION VERIFICATION
+--------------------------------------------------------------------------------
+
+The current cluster version, upgrade channel, and available updates were
+reviewed before any upgrade activity was started.
+
+  Command used:
+  $ oc get clusterversion
+
+  Output observed:
+  NAME      VERSION   AVAILABLE   PROGRESSING   SINCE   STATUS
+  version   4.13.6    True        False         10d     Cluster version is 4.13.6
+
+  Command used:
+  $ oc describe clusterversion version
+
+  Output observed:
+  Spec:
+    Channel:    stable-4.13
+    Cluster ID: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+    Upstream:   https://api.openshift.com/api/upgrades_info/v1/graph
+  Status:
+    Available Updates:
+      Version:  4.13.11
+      Image:    quay.io/openshift-release-dev/ocp-release@sha256:abc123...
+    History:
+      State:    Completed
+      Version:  4.13.6
+      Started:  2024-03-01T08:30:00Z
+      Completed:2024-03-01T10:00:00Z
+
+  Observation:
+  The cluster was confirmed on the stable-4.13 channel with version 4.13.11
+  available as the next update. The upgrade history was reviewed to estimate
+  the expected maintenance window duration (approximately 1.5 hours for the
+  previous upgrade).
+
+--------------------------------------------------------------------------------
+STEP 2 — CLUSTER OPERATOR HEALTH GATE CHECK
+--------------------------------------------------------------------------------
+
+All cluster operators were verified to be in a healthy state. This check
+serves as a hard gate — the upgrade was not to be initiated if any operator
+showed Degraded=True or Progressing=True.
+
+  Command used:
+  $ oc get clusteroperators
+
+  Output observed:
+  NAME                        VERSION   AVAILABLE   PROGRESSING   DEGRADED
+  authentication              4.13.6    True        False         False
+  cloud-credential            4.13.6    True        False         False
+  console                     4.13.6    True        False         False
+  dns                         4.13.6    True        False         False
+  etcd                        4.13.6    True        False         False
+  image-registry              4.13.6    True        False         False
+  ingress                     4.13.6    True        False         False
+  kube-apiserver              4.13.6    True        False         False
+  kube-controller-manager     4.13.6    True        False         False
+  kube-scheduler              4.13.6    True        False         False
+  machine-api                 4.13.6    True        False         False
+  machine-config              4.13.6    True        False         False
+  monitoring                  4.13.6    True        False         False
+  network                     4.13.6    True        False         False
+  storage                     4.13.6    True        False         False
+
+  Observation:
+  All operators showed Available=True, Progressing=False, Degraded=False.
+  The gate check was passed and the upgrade was cleared to proceed.
+
+--------------------------------------------------------------------------------
+STEP 3 — NODE READINESS VERIFICATION
+--------------------------------------------------------------------------------
+
+All cluster nodes were confirmed in Ready state before the upgrade was
+initiated. Nodes in NotReady state can cause the Machine Config Operator
+to stall during the upgrade process.
+
+  Command used:
+  $ oc get nodes
+
+  Output observed:
+  NAME                          STATUS   ROLES    AGE   VERSION
+  master-0.ocp.company.com      Ready    master   75d   v1.26.6+b49f9a1
+  master-1.ocp.company.com      Ready    master   75d   v1.26.6+b49f9a1
+  master-2.ocp.company.com      Ready    master   75d   v1.26.6+b49f9a1
+  worker-0.ocp.company.com      Ready    worker   75d   v1.26.6+b49f9a1
+  worker-1.ocp.company.com      Ready    worker   75d   v1.26.6+b49f9a1
+  worker-2.ocp.company.com      Ready    worker   75d   v1.26.6+b49f9a1
+
+  Observation:
+  All six nodes were confirmed in Ready state with no SchedulingDisabled
+  conditions present.
+
+--------------------------------------------------------------------------------
+STEP 4 — ETCD HEALTH VERIFICATION
+--------------------------------------------------------------------------------
+
+The etcd cluster health was verified using both the etcd operator status
+and direct member inspection. A degraded etcd during an upgrade can result
+in data loss and is considered a critical blocker.
+
+  Command used:
+  $ oc get etcd -o=jsonpath=\
+    '{range .items[0].status.conditions[*]}{.type}{"\t"}{.status}{"\n"}{end}'
+
+  Output observed:
+  EtcdMembersAvailable        True
+  EtcdQuorumAvailable         True
+  EtcdMembersDegraded         False
+  EtcdMembersProgressing      False
+
+  etcd member list was checked directly inside the etcd pod:
+
+  Command used:
+  $ oc rsh -n openshift-etcd etcd-master-0.ocp.company.com \
+      etcdctl member list \
+      --cacert=/etc/kubernetes/static-pod-certs/configmaps/etcd-serving-ca/ca-bundle.crt \
+      --cert=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-master-0.ocp.company.com.crt \
+      --key=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-master-0.ocp.company.com.key
+
+  Output observed:
+  abc1234, started, master-0, https://192.168.10.10:2380, https://192.168.10.10:2379
+  def5678, started, master-1, https://192.168.10.11:2380, https://192.168.10.11:2379
+  ghi9012, started, master-2, https://192.168.10.12:2380, https://192.168.10.12:2379
+
+  Observation:
+  All three etcd members were confirmed in started state. Quorum was
+  verified as healthy — a prerequisite before the backup and upgrade.
+
+--------------------------------------------------------------------------------
+STEP 5 — ETCD BACKUP (PRE-UPGRADE)
+--------------------------------------------------------------------------------
+
+An etcd backup was taken on the first master node before any upgrade
+activity. This backup serves as the restore point if the upgrade needs
+to be rolled back.
+
+  Command used:
+  $ oc debug node/master-0.ocp.company.com -- \
+      chroot /host \
+      /usr/local/bin/cluster-backup.sh /home/core/assets/backup
+
+  Output observed:
+  found latest kube-apiserver: /etc/kubernetes/static-pod-resources/kube-apiserver-pod-7
+  found latest kube-controller-manager: /etc/kubernetes/static-pod-resources/kube-controller-manager-pod-8
+  found latest kube-scheduler: /etc/kubernetes/static-pod-resources/kube-scheduler-pod-6
+  found latest etcd: /etc/kubernetes/static-pod-resources/etcd-pod-3
+  Snapshot saved at /home/core/assets/backup/snapshot_2026051908_db
+  backup complete
+
+  Backup file size was verified:
+
+  Command used:
+  $ oc debug node/master-0.ocp.company.com -- \
+      chroot /host \
+      ls -lh /home/core/assets/backup/
+
+  Output observed:
+  -rw-------. 1 root root 211M May 19 08:00 snapshot_2026051908_db
+  -rw-------. 1 root root 221K May 19 08:00 static_kuberesources_2026051908.tar.gz
+
+  The backup was copied off the node to the NFS backup location:
+
+  Command used:
+  $ scp core@master-0.ocp.company.com:/home/core/assets/backup/snapshot_2026051908_db \
+        /nfs/backups/openshift/etcd/
+
+  $ scp core@master-0.ocp.company.com:/home/core/assets/backup/static_kuberesources_2026051908.tar.gz \
+        /nfs/backups/openshift/etcd/
+
+  Observation:
+  Backup files were successfully transferred to external NFS storage.
+  The snapshot size of 211MB was consistent with a healthy etcd database.
+
+--------------------------------------------------------------------------------
+STEP 6 — UPGRADE CHANNEL AND PATH VALIDATION
+--------------------------------------------------------------------------------
+
+The upgrade channel was confirmed as stable before initiating the upgrade.
+The candidate and fast channels carry higher risk in production environments.
+
+  Command used:
+  $ oc patch clusterversion version \
+      --type merge \
+      -p '{"spec":{"channel":"stable-4.13"}}'
+
+  Available updates were listed:
+
+  Command used:
+  $ oc adm upgrade
+
+  Output observed:
+  Cluster version is 4.13.6
+
+  Updates:
+  VERSION     IMAGE
+  4.13.11     quay.io/openshift-release-dev/ocp-release@sha256:abc123...
+
+  Channel: stable-4.13
+
+  Note on upgrade path:
+  Minor version upgrades must follow sequential steps:
+    4.12 → 4.13 → 4.14   (Supported)
+    4.12 → 4.14           (Not supported — will be blocked by CVO)
+
+--------------------------------------------------------------------------------
+STEP 7 — PRE-UPGRADE WORKLOAD REVIEW
+--------------------------------------------------------------------------------
+
+PodDisruptionBudgets were reviewed to confirm they would not block node drain
+during the upgrade. Single-replica deployments were also identified and
+flagged to application teams.
+
+  Command used:
+  $ oc get pdb --all-namespaces
+
+  Output observed:
+  NAMESPACE     NAME          MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS
+  production    api-pdb       2               N/A               1
+  production    worker-pdb    1               N/A               2
+  monitoring    prometheus-pdb 1              N/A               1
+
+  Single-replica deployments were identified:
+
+  Command used:
+  $ oc get deployment --all-namespaces \
+      -o jsonpath='{range .items[?(@.spec.replicas==1)]}{.metadata.namespace}
+      {"\t"}{.metadata.name}{"\n"}{end}'
+
+  Output observed:
+  production      legacy-api
+  staging         batch-processor
+  monitoring      log-shipper
+
+  Observation:
+  Application teams were notified that single-replica workloads may
+  experience brief downtime during node drain. Teams were given the
+  option to scale up temporarily or accept the risk.
+
+  MachineConfigPool status was verified:
+
+  Command used:
+  $ oc get machineconfigpool
+
+  Output observed:
+  NAME     CONFIG                  UPDATED   UPDATING   DEGRADED   MACHINECOUNT
+  master   rendered-master-abc123  True      False      False      3
+  worker   rendered-worker-def456  True      False      False      6
+
+  Observation:
+  Both pools were confirmed UPDATED=True and DEGRADED=False. The
+  MachineConfigOperator was ready to process node upgrades.
+
+--------------------------------------------------------------------------------
+STEP 8 — WORKER MCP PAUSE (PRE-UPGRADE SAFETY MEASURE)
+--------------------------------------------------------------------------------
+
+The worker MachineConfigPool was paused before starting the upgrade so that
+control plane upgrade completion could be validated before workers were
+touched.
+
+  Command used:
+  $ oc patch machineconfigpool worker \
+      --type merge \
+      -p '{"spec":{"paused":true}}'
+
+  Observation:
+  This gives the administrator control to validate master upgrade success
+  before allowing the MCO to proceed with worker node upgrades.
+
+--------------------------------------------------------------------------------
+STEP 9 — UPGRADE INITIATION
+--------------------------------------------------------------------------------
+
+The upgrade was initiated targeting the specific 4.13.11 release version.
+
+  Command used:
+  $ oc adm upgrade --to=4.13.11
+
+  Output observed:
+  Updating to 4.13.11
+
+  Upgrade progress was monitored:
+
+  Command used:
+  $ watch -n 30 oc get clusterversion
+
+  Output observed (during upgrade):
+  NAME      VERSION    AVAILABLE   PROGRESSING   STATUS
+  version   4.13.6     True        True          Working towards 4.13.11:
+                                                 108 of 812 done (13% complete)
+
+  Cluster operators upgrading one by one were monitored:
+
+  Command used:
+  $ watch -n 30 'oc get clusteroperators | grep -v "True.*False.*False"'
+
+  Output observed (mid-upgrade):
+  NAME              VERSION    AVAILABLE   PROGRESSING   DEGRADED
+  kube-apiserver    4.13.6     True        True          False
+
+  Observation:
+  Operators updated sequentially. The kube-apiserver was observed
+  progressing while others remained stable — this is expected behavior
+  during a rolling control plane upgrade.
+
+--------------------------------------------------------------------------------
+STEP 10 — NODE UPGRADE MONITORING VIA MACHINECONFIGPOOL
+--------------------------------------------------------------------------------
+
+After control plane operators completed, the worker MCP was unpaused and
+node-level upgrades were observed through the MachineConfigPool status.
+
+  Worker MCP was unpaused:
+
+  Command used:
+  $ oc patch machineconfigpool worker \
+      --type merge \
+      -p '{"spec":{"paused":false}}'
+
+  MachineConfigPool upgrade progress was observed:
+
+  Command used:
+  $ watch -n 30 oc get machineconfigpool
+
+  Output observed (masters upgrading):
+  NAME     CONFIG                  UPDATED   UPDATING   DEGRADED   MACHINECOUNT   READYMACHINECOUNT
+  master   rendered-master-newxyz  False     True       False      3              2
+  worker   rendered-worker-def456  True      False      False      6              6
+
+  Output observed (workers upgrading):
+  NAME     CONFIG                  UPDATED   UPDATING   DEGRADED   MACHINECOUNT   READYMACHINECOUNT
+  master   rendered-master-newxyz  True      False      False      3              3
+  worker   rendered-worker-newxyz  False     True       False      6              4
+
+  Individual node cordon/drain/reboot cycle was observed:
+
+  Command used:
+  $ oc get nodes -w
+
+  Output observed:
+  NAME        STATUS                      ROLES    VERSION
+  master-0    Ready                       master   v1.26.6+b49f9a1
+  master-0    Ready,SchedulingDisabled    master   v1.26.6+b49f9a1
+  master-0    NotReady,SchedulingDisabled master   v1.26.6+b49f9a1
+  master-0    Ready                       master   v1.27.6+b49f9a1
+
+  Observation:
+  Each node was automatically cordoned, drained, rebooted into new RHCOS,
+  then uncordoned. The entire lifecycle per node was managed by the Machine
+  Config Operator without manual intervention.
+
+--------------------------------------------------------------------------------
+STEP 11 — POST-UPGRADE VALIDATION
+--------------------------------------------------------------------------------
+
+The upgrade completion was confirmed and all cluster components were
+validated on the new version.
+
+  Command used:
+  $ oc get clusterversion
+
+  Output observed:
+  NAME      VERSION    AVAILABLE   PROGRESSING   STATUS
+  version   4.13.11    True        False         Cluster version is 4.13.11
+
+  All cluster operators were verified on the new version:
+
+  Command used:
+  $ oc get clusteroperators
+
+  Output observed:
+  NAME                    VERSION    AVAILABLE   PROGRESSING   DEGRADED
+  authentication          4.13.11    True        False         False
+  console                 4.13.11    True        False         False
+  dns                     4.13.11    True        False         False
+  etcd                    4.13.11    True        False         False
+  ingress                 4.13.11    True        False         False
+  kube-apiserver          4.13.11    True        False         False
+  machine-config          4.13.11    True        False         False
+  monitoring              4.13.11    True        False         False
+  network                 4.13.11    True        False         False
+  storage                 4.13.11    True        False         False
+
+  All nodes were verified on the updated kubelet version:
+
+  Command used:
+  $ oc get nodes
+
+  Output observed:
+  NAME                          STATUS   ROLES    AGE   VERSION
+  master-0.ocp.company.com      Ready    master   75d   v1.27.6+b49f9a1
+  master-1.ocp.company.com      Ready    master   75d   v1.27.6+b49f9a1
+  master-2.ocp.company.com      Ready    master   75d   v1.27.6+b49f9a1
+  worker-0.ocp.company.com      Ready    worker   75d   v1.27.6+b49f9a1
+  worker-1.ocp.company.com      Ready    worker   75d   v1.27.6+b49f9a1
+  worker-2.ocp.company.com      Ready    worker   75d   v1.27.6+b49f9a1
+
+  Pods across all namespaces were checked for any failures:
+
+  Command used:
+  $ oc get pods --all-namespaces | grep -v Running | grep -v Completed
+
+  Output observed:
+  No resources found.
+
+  etcd health was re-verified post-upgrade:
+
+  Command used:
+  $ oc get etcd -o=jsonpath=\
+    '{range .items[0].status.conditions[*]}{.type}{"\t"}{.status}{"\n"}{end}'
+
+  Output observed:
+  EtcdMembersAvailable      True
+  EtcdQuorumAvailable       True
+  EtcdMembersDegraded       False
+  EtcdMembersProgressing    False
+
+--------------------------------------------------------------------------------
+STEP 12 — ROLLBACK PROCEDURE (DOCUMENTED)
+--------------------------------------------------------------------------------
+
+A rollback procedure was documented as part of the change plan prior to
+the maintenance window. OpenShift does not support in-place cluster version
+downgrade; rollback is achieved via etcd restore.
+
+  Rollback steps (to be executed only if upgrade fails critically):
+
+  Step 1 — Copy the pre-upgrade backup back to master nodes:
+
+  $ scp /nfs/backups/openshift/etcd/snapshot_2026051908_db \
+        core@master-0.ocp.company.com:/home/core/assets/backup/
+
+  Step 2 — Run the cluster restore script on each master node
+           starting with master-0:
+
+  $ oc debug node/master-0.ocp.company.com -- \
+      chroot /host \
+      /usr/local/bin/cluster-restore.sh /home/core/assets/backup
+
+  Output observed (restore):
+  Stopping all static pods
+  ...
+  Starting restore from /home/core/assets/backup/snapshot_2026051908_db
+  Restore complete. Please verify cluster health.
+
+  Step 3 — Verify API server recovery after restore:
+
+  $ oc get nodes
+  $ oc get clusteroperators
+
+  Note:
+  After etcd restore, static pods restart automatically and the API server
+  recovers at the pre-upgrade version. This process is disruptive and
+  should only be triggered if the upgrade results in a non-recoverable
+  cluster state.
+
+--------------------------------------------------------------------------------
+SUMMARY
+--------------------------------------------------------------------------------
+
+  Phase          Action                        Command
+  -------------- ----------------------------- --------------------------------
+  Pre-check      Cluster operator gate         oc get clusteroperators
+  Pre-check      etcd quorum verification      oc get etcd
+  Pre-check      Node readiness                oc get nodes
+  Pre-check      PDB and single-replica review oc get pdb --all-namespaces
+  Backup         etcd snapshot                 cluster-backup.sh
+  Upgrade path   Set stable channel            oc patch clusterversion
+  Safety         Pause worker MCP              oc patch machineconfigpool
+  Execute        Trigger upgrade               oc adm upgrade --to=
+  Monitor        CVO progress                  watch oc get clusterversion
+  Monitor        MCP node drain                watch oc get machineconfigpool
+  Resume         Unpause worker MCP            oc patch machineconfigpool
+  Post-check     All operators on new version  oc get clusteroperators
+  Post-check     All nodes on new version      oc get nodes
+  Rollback       etcd restore                  cluster-restore.sh
+
+================================================================================
+ END 
+================================================================================
