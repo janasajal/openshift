@@ -1,0 +1,409 @@
+================================================================================
+  OpenShift Administration Lab
+  Persistent Storage Provisioning Request
+  Topic        : PVC, StorageClass, and StatefulSet Storage Configuration
+  Author       : Sajal Jana 
+================================================================================
+
+
+OVERVIEW
+--------
+A persistent storage provisioning request was raised for a stateful application
+requiring dedicated block storage for a PostgreSQL database. The storage was
+provisioned using OpenShift Container Storage (OCS) with Ceph RBD as the
+backend. A custom StorageClass was created for high-performance workloads, a
+PersistentVolumeClaim was submitted, and storage was attached to the workload
+via both a Deployment and a StatefulSet with volumeClaimTemplates. All steps
+were validated including volume mount verification inside the running pod.
+
+
+--------------------------------------------------------------------------------
+STEP 1 : AVAILABLE STORAGECLASSES REVIEWED
+--------------------------------------------------------------------------------
+
+The existing StorageClasses available in the cluster were listed to understand
+what provisioners and reclaim policies were already configured.
+
+  Command :
+  ---------
+  $ oc get storageclass
+
+  Output :
+  --------
+  NAME                                PROVISIONER                              RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION   AGE
+  ocs-storagecluster-ceph-rbd (default)  openshift-storage.rbd.csi.ceph.com   Delete          Immediate              true                   10d
+  ocs-storagecluster-cephfs              openshift-storage.cephfs.csi.ceph.com Delete         Immediate              true                   10d
+  thin-csi                               csi.vsphere.volume                    Delete          WaitForFirstConsumer   true                   10d
+
+  $ oc describe storageclass ocs-storagecluster-ceph-rbd
+
+  Output :
+  --------
+  Name:                  ocs-storagecluster-ceph-rbd
+  IsDefaultClass:        Yes
+  Provisioner:           openshift-storage.rbd.csi.ceph.com
+  ReclaimPolicy:         Delete
+  VolumeBindingMode:     Immediate
+  AllowVolumeExpansion:  true
+  Parameters:
+    csi.storage.k8s.io/fstype:   ext4
+    imageFeatures:               layering
+    pool:                        ocs-storagecluster-cephblockpool
+
+Storage type selection notes :
+  - Ceph RBD  : block storage, ReadWriteOnce  (RWO) - suitable for databases
+  - CephFS    : file storage, ReadWriteMany   (RWX) - suitable for shared mounts
+  - thin-csi  : vSphere CSI, WaitForFirstConsumer   - zone-aware provisioning
+
+
+--------------------------------------------------------------------------------
+STEP 2 : CUSTOM STORAGECLASS CREATED
+--------------------------------------------------------------------------------
+
+A dedicated high-performance StorageClass was created for the database workload.
+The ReclaimPolicy was set to Retain to protect data in case the PVC is
+accidentally deleted. WaitForFirstConsumer binding mode was used to ensure
+the PV is provisioned in the same availability zone as the consuming pod.
+
+  File : storageclass-fast.yaml
+  ------------------------------
+  apiVersion: storage.k8s.io/v1
+  kind: StorageClass
+  metadata:
+    name: ceph-rbd-fast
+    annotations:
+      storageclass.kubernetes.io/is-default-class: "false"
+  provisioner: openshift-storage.rbd.csi.ceph.com
+  parameters:
+    clusterID: openshift-storage
+    pool: ocs-storagecluster-cephblockpool-fast
+    csi.storage.k8s.io/fstype: ext4
+    csi.storage.k8s.io/provisioner-secret-name: rook-csi-rbd-provisioner
+    csi.storage.k8s.io/provisioner-secret-namespace: openshift-storage
+    csi.storage.k8s.io/node-stage-secret-name: rook-csi-rbd-node
+    csi.storage.k8s.io/node-stage-secret-namespace: openshift-storage
+  reclaimPolicy: Retain
+  allowVolumeExpansion: true
+  volumeBindingMode: WaitForFirstConsumer
+
+  Command :
+  ---------
+  $ oc apply -f storageclass-fast.yaml
+
+  Output :
+  --------
+  storageclass.storage.k8s.io/ceph-rbd-fast created
+
+ReclaimPolicy : Retain
+  - When a PVC is deleted, the underlying PV is not deleted automatically.
+  - The PV moves to Released state and data remains intact on the storage backend.
+  - Manual intervention is required to reclaim or reuse the volume.
+  - This is the recommended policy for production database storage.
+
+
+--------------------------------------------------------------------------------
+STEP 3 : PERSISTENTVOLUMECLAIM CREATED
+--------------------------------------------------------------------------------
+
+A PVC was submitted against the ceph-rbd-fast StorageClass requesting 50Gi
+of block storage with ReadWriteOnce access mode for the PostgreSQL database.
+
+  File : pvc-myapp-db.yaml
+  -------------------------
+  apiVersion: v1
+  kind: PersistentVolumeClaim
+  metadata:
+    name: myapp-db-pvc
+    namespace: dev-team-app
+    labels:
+      app: myapp
+      tier: database
+  spec:
+    accessModes:
+      - ReadWriteOnce
+    storageClassName: ceph-rbd-fast
+    resources:
+      requests:
+        storage: 50Gi
+
+  Command :
+  ---------
+  $ oc apply -f pvc-myapp-db.yaml
+
+  Output :
+  --------
+  persistentvolumeclaim/myapp-db-pvc created
+
+  $ oc get pvc -n dev-team-app
+
+  Output :
+  --------
+  NAME            STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS    AGE
+  myapp-db-pvc    Pending   -        -          RWO            ceph-rbd-fast   10s
+
+The PVC status shows Pending, which is the expected behaviour. Since the
+StorageClass uses WaitForFirstConsumer binding mode, the PersistentVolume
+is not provisioned until a pod references this PVC. This ensures the volume
+is created in the same availability zone as the scheduled pod.
+
+
+--------------------------------------------------------------------------------
+STEP 4 : DEPLOYMENT WITH PERSISTENT VOLUME ATTACHED
+--------------------------------------------------------------------------------
+
+The PVC was attached to a PostgreSQL Deployment via the volumes and
+volumeMounts sections. The database credentials were sourced from a Secret
+to avoid hardcoding sensitive values in the manifest.
+
+  File : deployment-with-storage.yaml
+  -------------------------------------
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: myapp-db
+    namespace: dev-team-app
+  spec:
+    replicas: 1
+    selector:
+      matchLabels:
+        app: myapp-db
+    template:
+      metadata:
+        labels:
+          app: myapp-db
+      spec:
+        containers:
+        - name: postgres
+          image: registry.redhat.io/rhel8/postgresql-13:latest
+          ports:
+          - containerPort: 5432
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          env:
+          - name: POSTGRESQL_USER
+            valueFrom:
+              secretKeyRef:
+                name: myapp-db-secret
+                key: username
+          - name: POSTGRESQL_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: myapp-db-secret
+                key: password
+          - name: POSTGRESQL_DATABASE
+            value: myappdb
+          volumeMounts:
+          - name: db-storage
+            mountPath: /var/lib/pgsql/data
+        volumes:
+        - name: db-storage
+          persistentVolumeClaim:
+            claimName: myapp-db-pvc
+
+  Command :
+  ---------
+  $ oc apply -f deployment-with-storage.yaml
+
+  Output :
+  --------
+  deployment.apps/myapp-db created
+
+
+--------------------------------------------------------------------------------
+STEP 5 : STATEFULSET WITH VOLUMECLAIMTEMPLATES (PRODUCTION APPROACH)
+--------------------------------------------------------------------------------
+
+For production-grade stateful workloads with multiple replicas, a StatefulSet
+was used with volumeClaimTemplates. This approach automatically provisions a
+dedicated PVC for each pod replica, ensuring data isolation per instance.
+
+  File : statefulset-db.yaml
+  ---------------------------
+  apiVersion: apps/v1
+  kind: StatefulSet
+  metadata:
+    name: myapp-db
+    namespace: dev-team-app
+  spec:
+    serviceName: myapp-db-headless
+    replicas: 3
+    selector:
+      matchLabels:
+        app: myapp-db
+    template:
+      metadata:
+        labels:
+          app: myapp-db
+      spec:
+        containers:
+        - name: postgres
+          image: registry.redhat.io/rhel8/postgresql-13:latest
+          ports:
+          - containerPort: 5432
+          volumeMounts:
+          - name: db-data
+            mountPath: /var/lib/pgsql/data
+    volumeClaimTemplates:
+    - metadata:
+        name: db-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: ceph-rbd-fast
+        resources:
+          requests:
+            storage: 50Gi
+
+  Command :
+  ---------
+  $ oc apply -f statefulset-db.yaml
+
+  Output :
+  --------
+  statefulset.apps/myapp-db created
+
+The StatefulSet automatically creates the following PVCs upon pod scheduling :
+  db-data-myapp-db-0   -->  dedicated to pod myapp-db-0
+  db-data-myapp-db-1   -->  dedicated to pod myapp-db-1
+  db-data-myapp-db-2   -->  dedicated to pod myapp-db-2
+
+Each PVC is independently bound and persists even if the pod is deleted,
+ensuring data durability across pod restarts and rescheduling events.
+
+
+--------------------------------------------------------------------------------
+STEP 6 : VALIDATION
+--------------------------------------------------------------------------------
+
+6.1  PVC Binding Status Verified
+  ---------------------------------
+  $ oc get pvc -n dev-team-app
+
+  Output :
+  --------
+  NAME                 STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS    AGE
+  myapp-db-pvc         Bound    pvc-a1b2c3d4-1234-5678-abcd-ef1234567890   50Gi       RWO            ceph-rbd-fast   2m
+  db-data-myapp-db-0   Bound    pvc-b2c3d4e5-2345-6789-bcde-f12345678901   50Gi       RWO            ceph-rbd-fast   1m
+  db-data-myapp-db-1   Bound    pvc-c3d4e5f6-3456-7890-cdef-123456789012   50Gi       RWO            ceph-rbd-fast   1m
+  db-data-myapp-db-2   Bound    pvc-d4e5f6g7-4567-8901-def0-234567890123   50Gi       RWO            ceph-rbd-fast   1m
+
+  All PVCs transitioned from Pending to Bound after pod scheduling.
+
+
+6.2  PersistentVolume Verified
+  --------------------------------
+  $ oc get pv | grep dev-team-app
+
+  Output :
+  --------
+  pvc-a1b2c3d4-...   50Gi   RWO   Retain   Bound   dev-team-app/myapp-db-pvc   ceph-rbd-fast   2m
+
+  The PV was dynamically provisioned by the Ceph RBD CSI provisioner and the
+  reclaim policy is confirmed as Retain.
+
+
+6.3  Pod Status Verified
+  ------------------------
+  $ oc get pods -n dev-team-app -l app=myapp-db
+
+  Output :
+  --------
+  NAME          READY   STATUS    RESTARTS   AGE
+  myapp-db-0    1/1     Running   0          2m
+  myapp-db-1    1/1     Running   0          90s
+  myapp-db-2    1/1     Running   0          60s
+
+  All three StatefulSet pods are running with their respective volumes mounted.
+
+
+6.4  Volume Mount Inside Pod Verified
+  --------------------------------------
+  $ oc exec -it myapp-db-0 -n dev-team-app -- df -h /var/lib/pgsql/data
+
+  Output :
+  --------
+  Filesystem               Size  Used Avail Use% Mounted on
+  /dev/rbd0                 50G  389M   50G   1% /var/lib/pgsql/data
+
+  The Ceph RBD block device was confirmed as mounted at the expected path
+  inside the pod with 50Gi capacity available.
+
+
+6.5  PVC Detailed Description Verified
+  ----------------------------------------
+  $ oc describe pvc myapp-db-pvc -n dev-team-app
+
+  Output :
+  --------
+  Name:          myapp-db-pvc
+  Namespace:     dev-team-app
+  StorageClass:  ceph-rbd-fast
+  Status:        Bound
+  Volume:        pvc-a1b2c3d4-1234-5678-abcd-ef1234567890
+  Capacity:      50Gi
+  Access Modes:  RWO
+  VolumeMode:    Filesystem
+  Mounted By:    myapp-db-0
+  Events:
+    Normal  Provisioning           2m  openshift-storage.rbd.csi.ceph.com  External provisioner is provisioning volume
+    Normal  ProvisioningSucceeded  2m  openshift-storage.rbd.csi.ceph.com  Successfully provisioned volume
+
+
+--------------------------------------------------------------------------------
+STEP 7 : ONLINE VOLUME EXPANSION
+--------------------------------------------------------------------------------
+
+A storage expansion request was received after the initial provisioning.
+The PVC was patched to increase the capacity from 50Gi to 100Gi. The
+StorageClass was pre-confirmed to have allowVolumeExpansion: true before
+the expansion was initiated.
+
+  Command :
+  ---------
+  $ oc patch pvc myapp-db-pvc -n dev-team-app \
+      -p '{"spec":{"resources":{"requests":{"storage":"100Gi"}}}}'
+
+  Output :
+  --------
+  persistentvolumeclaim/myapp-db-pvc patched
+
+  $ oc get pvc myapp-db-pvc -n dev-team-app
+
+  Output :
+  --------
+  NAME            STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS    AGE
+  myapp-db-pvc    Bound    pvc-a1b2c3d4-...                          100Gi      RWO            ceph-rbd-fast   10m
+
+  The volume was expanded online without requiring pod restart or downtime.
+
+
+--------------------------------------------------------------------------------
+SUMMARY
+--------------------------------------------------------------------------------
+
+  The following storage configurations were completed for dev-team-app :
+
+  [OK]  StorageClasses reviewed    - Ceph RBD, CephFS, thin-csi identified
+  [OK]  Custom StorageClass        - ceph-rbd-fast created, ReclaimPolicy Retain
+  [OK]  PVC created                - 50Gi RWO, WaitForFirstConsumer binding
+  [OK]  Deployment storage         - PVC attached via volumes/volumeMounts
+  [OK]  StatefulSet storage        - volumeClaimTemplates, per-pod PVCs created
+  [OK]  PVC binding confirmed      - all PVCs in Bound state
+  [OK]  Volume mount verified      - df -h inside pod shows correct filesystem
+  [OK]  Online expansion tested    - 50Gi expanded to 100Gi without downtime
+
+  Access mode reference used in this lab :
+    RWO (ReadWriteOnce) : mounted by one pod at a time  - used for databases
+    RWX (ReadWriteMany) : mounted by multiple pods      - use CephFS for this
+
+  All manifest files were stored in the GitOps repository under :
+  /gitops/projects/dev-team-app/storage/
+
+================================================================================
+  END 
+================================================================================
