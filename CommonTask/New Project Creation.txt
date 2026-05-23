@@ -1,0 +1,254 @@
+================================================================================
+  OpenShift Administration Lab
+  New Project / Namespace Creation
+  Topic        : Resource Quotas, LimitRange, and RBAC Configuration
+  Author       : Sajal Jana 
+================================================================================
+
+
+OVERVIEW
+--------
+A new OpenShift project was requested by the development team. The project was
+configured with resource quotas, limit ranges, and role-based access control
+(RBAC) to ensure proper resource governance and access management. The following
+steps were carried out to complete the setup and validate the configuration.
+
+
+--------------------------------------------------------------------------------
+STEP 1 : PROJECT CREATION
+--------------------------------------------------------------------------------
+
+The project was created using the oc new-project command with a display name
+and description to keep the namespace clearly identified in the cluster.
+
+  Command :
+  ---------
+  $ oc new-project dev-team-app \
+      --display-name="Dev Team Application" \
+      --description="Project for the development team - App workloads"
+
+  Output :
+  --------
+  Now using project "dev-team-app" on server "https://api.ocp.example.com:6443".
+
+The project was confirmed as active and the context was automatically switched
+to the newly created namespace.
+
+
+--------------------------------------------------------------------------------
+STEP 2 : RESOURCE QUOTA CONFIGURATION
+--------------------------------------------------------------------------------
+
+A ResourceQuota manifest was prepared to cap the total resource consumption
+at the namespace level. This ensures no single team can exhaust cluster-wide
+compute and storage resources.
+
+  File : resource-quota.yaml
+  ---------------------------
+  apiVersion: v1
+  kind: ResourceQuota
+  metadata:
+    name: dev-team-quota
+    namespace: dev-team-app
+  spec:
+    hard:
+      requests.cpu: "4"
+      requests.memory: 8Gi
+      limits.cpu: "8"
+      limits.memory: 16Gi
+      pods: "20"
+      persistentvolumeclaims: "10"
+      services: "10"
+      secrets: "30"
+      configmaps: "20"
+
+  Command :
+  ---------
+  $ oc apply -f resource-quota.yaml
+
+  Output :
+  --------
+  resourcequota/dev-team-quota created
+
+The quota was applied successfully to the dev-team-app namespace.
+
+
+--------------------------------------------------------------------------------
+STEP 3 : LIMIT RANGE CONFIGURATION
+--------------------------------------------------------------------------------
+
+A LimitRange was configured to enforce per-container default requests and
+limits. This prevents pods from being scheduled without resource boundaries
+and ensures the namespace-level quota is consumed predictably.
+
+  File : limit-range.yaml
+  ------------------------
+  apiVersion: v1
+  kind: LimitRange
+  metadata:
+    name: dev-team-limits
+    namespace: dev-team-app
+  spec:
+    limits:
+    - type: Container
+      default:
+        cpu: "500m"
+        memory: "512Mi"
+      defaultRequest:
+        cpu: "200m"
+        memory: "256Mi"
+      max:
+        cpu: "2"
+        memory: "4Gi"
+      min:
+        cpu: "50m"
+        memory: "64Mi"
+    - type: Pod
+      max:
+        cpu: "4"
+        memory: "8Gi"
+
+  Command :
+  ---------
+  $ oc apply -f limit-range.yaml
+
+  Output :
+  --------
+  limitrange/dev-team-limits created
+
+The LimitRange was applied. Any container deployed without explicit resource
+definitions will now automatically inherit the default values defined above.
+
+
+--------------------------------------------------------------------------------
+STEP 4 : RBAC CONFIGURATION
+--------------------------------------------------------------------------------
+
+Role bindings were configured based on the principle of least privilege.
+The dev lead was assigned the admin role, developers were assigned the edit
+role, and QA personnel were assigned the view-only role.
+
+  Commands :
+  ----------
+  $ oc adm policy add-role-to-user admin dev-lead-user -n dev-team-app
+  $ oc adm policy add-role-to-user edit developer1 -n dev-team-app
+  $ oc adm policy add-role-to-user edit developer2 -n dev-team-app
+  $ oc adm policy add-role-to-user view qa-user1 -n dev-team-app
+
+  Output :
+  --------
+  clusterrole.rbac.authorization.k8s.io/admin added: "dev-lead-user"
+  clusterrole.rbac.authorization.k8s.io/edit added: "developer1"
+  clusterrole.rbac.authorization.k8s.io/edit added: "developer2"
+  clusterrole.rbac.authorization.k8s.io/view added: "qa-user1"
+
+Role summary :
+  dev-lead-user  -->  admin  (full project control, no cluster-level access)
+  developer1     -->  edit   (deploy and manage workloads, no RBAC changes)
+  developer2     -->  edit   (deploy and manage workloads, no RBAC changes)
+  qa-user1       -->  view   (read-only access to all resources)
+
+
+--------------------------------------------------------------------------------
+STEP 5 : VALIDATION
+--------------------------------------------------------------------------------
+
+5.1  Project Status Verified
+  ---------------------------
+  $ oc get project dev-team-app
+
+  Output :
+  --------
+  NAME           DISPLAY NAME             STATUS
+  dev-team-app   Dev Team Application     Active
+
+
+5.2  Resource Quota Verified
+  ---------------------------
+  $ oc describe quota dev-team-quota -n dev-team-app
+
+  Output :
+  --------
+  Name:                   dev-team-quota
+  Namespace:              dev-team-app
+  Resource                Used    Hard
+  --------                ----    ----
+  configmaps              0       20
+  limits.cpu              0       8
+  limits.memory           0       16Gi
+  persistentvolumeclaims  0       10
+  pods                    0       20
+  requests.cpu            0       4
+  requests.memory         0       8Gi
+  secrets                 1       30
+  services                0       10
+
+  All quota counters show zero usage as no workloads have been deployed yet.
+  The single secret counted is the default service account token.
+
+
+5.3  LimitRange Verified
+  -----------------------
+  $ oc describe limitrange dev-team-limits -n dev-team-app
+
+  Output :
+  --------
+  Name:       dev-team-limits
+  Namespace:  dev-team-app
+  Type        Resource  Min    Max   Default Request  Default Limit
+  ----        --------  ---    ---   ---------------  -------------
+  Container   cpu       50m    2     200m             500m
+  Container   memory    64Mi   4Gi   256Mi            512Mi
+  Pod         cpu       -      4     -                -
+  Pod         memory    -      8Gi   -                -
+
+
+5.4  RBAC Role Bindings Verified
+  --------------------------------
+  $ oc get rolebindings -n dev-team-app
+
+  Output :
+  --------
+  NAME                    ROLE                               AGE
+  admin                   ClusterRole/admin                  3m
+  edit                    ClusterRole/edit                   3m
+  view                    ClusterRole/view                   3m
+  system:deployers        ClusterRole/system:deployer        3m
+  system:image-pullers    ClusterRole/system:image-puller    3m
+
+
+5.5  Access Permission Verified
+  --------------------------------
+  $ oc adm policy who-can get pods -n dev-team-app
+
+  Output :
+  --------
+  Namespace: dev-team-app
+  Verb:      get
+  Resource:  pods
+
+  Users:  dev-lead-user
+          developer1
+          developer2
+          qa-user1
+          system:admin
+
+
+--------------------------------------------------------------------------------
+SUMMARY
+--------------------------------------------------------------------------------
+
+  The following configurations were completed for the dev-team-app project :
+
+  [OK]  Project created with display name and description
+  [OK]  ResourceQuota applied  - namespace-level CPU, memory, pod, PVC caps
+  [OK]  LimitRange applied     - per-container default requests and limits
+  [OK]  RBAC configured        - admin / edit / view roles assigned
+  [OK]  All validations passed - quota, limitrange, rolebindings confirmed
+
+  All manifest files were stored in the GitOps repository under :
+  /gitops/projects/dev-team-app/
+
+================================================================================
+  END 
+================================================================================
