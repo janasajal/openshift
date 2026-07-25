@@ -21,7 +21,9 @@
 
 ---
 ## If you are using Redhat Lab, then run this command.
+```
 lab start virtualization-deploy
+```
 
 ## Step 1: Deploy OpenShift Virtualization Operator
 
