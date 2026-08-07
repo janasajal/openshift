@@ -13,6 +13,8 @@ Managing users and groups centrally is critical in enterprise Kubernetes environ
 1. **Create a Bind User in FreeIPA:** Run this on LDAP server.
 First, create a dedicated "bind" user that OpenShift will use to query LDAP directory. It is best practice to use a service account rather than a personal admin account.
 
+N.B: A bind user is required because OpenShift must authenticate to the LDAP server before it can search for users and groups. It acts as a dedicated read-only service account that allows OpenShift to locate a user's Distinguished Name (DN) and retrieve group information. Using a bind user is more secure than using an administrator account and avoids enabling anonymous LDAP access.
+
 ```bash
 ipa user-add ldapbind --first=ldap --last=bind --password
 # Enter password when prompted
