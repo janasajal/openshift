@@ -10,7 +10,8 @@ This lab report details the steps taken to handle `AdminAckRequired` blockers, s
 
 Before initiating the upgrade, several critical checks were performed to ensure cluster health:
 
-* Operators were verified to ensure none were in a "Degraded" state.
+* Operators were verified to ensure none were in a "Degraded" state. oc get clusteroperators or using the short alias: oc get co
+
 * Pod Disruption Budgets (PDBs) were reviewed. (Strict PDBs can cause upgrades to hang, while overly generous PDBs can impact application availability during node draining).
 * The cluster was checked for failing pods.
 * A diagnostic data collection was run using the `oc adm must-gather` command.
