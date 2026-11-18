@@ -14,7 +14,8 @@ Before initiating the upgrade, several critical checks were performed to ensure 
 
 * Pod Disruption Budgets (PDBs) were reviewed. (Strict PDBs can cause upgrades to hang, while overly generous PDBs can impact application availability during node draining). #oc get pdb --all-namespaces
 
-* The cluster was checked for failing pods.
+* The cluster was checked for failing pods. #oc get pods -A | grep -vE 'Running|Completed'
+
 * A diagnostic data collection was run using the `oc adm must-gather` command.
 
 ---
@@ -98,3 +99,36 @@ Once the upgrade command was executed, the OpenShift automation handled the node
 2. **Worker Nodes:** After the control plane was updated, the worker nodes followed the same sequential process (Cordon -> Drain -> Update -> Reboot -> Uncordoned).
 
 This lab demonstrated that the upgrade process is straightforward provided that API deprecations are properly handled, the correct channel is set, and comprehensive pre-checks are not skipped.
+
+## OpenShift Upgrade Stuck at 72%? Here's Your Quick Diagnostic Playbook
+
+If your OCP cluster upgrade freezes around 72%, it's almost always the Machine Config Operator (MCO) waiting on a worker node.
+
+Here's the fast-track fix 
+
+Check cluster version status
+oc get clusterversion
+→ Read the Progressing condition message — it names the blocker.
+
+Check operator health
+oc get co
+→ Look for Degraded=True or long-running Progressing=True.
+
+Check MachineConfigPools
+oc get mcp
+→ UPDATEDMACHINECOUNT ≠ MACHINECOUNT = a node is stuck.
+
+Inspect the stuck node
+oc describe node <node-name>
+→ Common blockers: failed drain, PodDisruptionBudget, NotReady status.
+
+Check for un-evictable pods
+oc get pods -A --field-selector spec.nodeName=<node-name>
+→ Usually a PDB with minAvailable set too high.
+
+Top 3 root causes in production:
+• PodDisruptionBudget blocking node drain
+• Node fails to reboot cleanly (firmware/hypervisor hang)
+• No spare capacity to reschedule evicted pods
+
+Before every major upgrade, audit your PDBs and confirm cluster headroom. 90% of "stuck upgrade" tickets trace back to one of these two.
